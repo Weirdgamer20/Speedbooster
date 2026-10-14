@@ -64,7 +64,7 @@ bash wsl_start.sh
 ### Security and Benchmarking Notes
 
 * The dashboard and proxy bind to loopback by default. Binding to a LAN/public address requires `--allow-remote-bind`; this exposes unauthenticated services, so use it only on a trusted network with firewall restrictions.
-* The raw proxy rejects private, loopback, link-local, and reserved destinations by default. `ALLOW_LOCAL_TEST_DOWNLOADS=1` is for isolated tests only; do not enable it for an exposed service.
+* The raw proxy rejects private, loopback, link-local, and reserved destinations by default. The SSRF-safe Requests helper also rejects explicit proxy routing because it cannot guarantee destination-IP pinning through a proxy. `ALLOW_LOCAL_TEST_DOWNLOADS=1` is for isolated tests only; do not enable it for an exposed service.
 * Proxy mode balances separate connections; it does not stripe one arbitrary TCP connection across links. Download aggregation requires a range-capable server and multiple eligible chunks. Physical multi-WAN gains require genuinely independent upstream paths.
 * The follow-up audit branch has CI coverage for Python 3.11 and 3.12. Physical adapter isolation remains unverified in hosted CI.
 
