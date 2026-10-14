@@ -71,7 +71,10 @@ def main():
 
     if not args.diagnose and not args.download:
         try:
-            loopback_bind = ipaddress.ip_address(args.host).is_loopback
+            bind_ip = ipaddress.ip_address(args.host)
+            if bind_ip.version != 4:
+                parser.error("The current dashboard/proxy listeners use IPv4 sockets; use an IPv4 bind address.")
+            loopback_bind = bind_ip.is_loopback
         except ValueError:
             loopback_bind = args.host.lower() == "localhost"
         if not loopback_bind and not args.allow_remote_bind:
