@@ -112,13 +112,18 @@ class MultiWANProxyServer:
         if target.startswith("[") and "]" in target:
             host = target[1:target.index("]")]
             rest = target[target.index("]") + 1:]
-            port = int(rest.lstrip(":")) if ":" in rest else default_port
-            return host, port
+            if rest and not rest.startswith(":"):
+                raise ValueError("Malformed bracketed host/port")
+            port = int(rest[1:]) if rest else default_port
         elif ":" in target:
             parts = target.rsplit(":", 1)
-            return parts[0], int(parts[1])
+            host, port = parts[0], int(parts[1])
         else:
-            return target, default_port
+            host, port = target, default_port
+
+        if not host or not 1 <= port <= 65535:
+            raise ValueError("Destination port must be between 1 and 65535")
+        return host, port
 
     def _handle_client(self, client_sock: socket.socket):
         self._optimize_socket(client_sock)
@@ -145,7 +150,12 @@ class MultiWANProxyServer:
 
             if method.upper() == "CONNECT":
                 # HTTPS Tunneling
-                host, port = self._parse_host_port(target, default_port=443)
+                try:
+                    host, port = self._parse_host_port(target, default_port=443)
+                except (TypeError, ValueError):
+                    client_sock.sendall(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nInvalid CONNECT host/port\r\n")
+                    client_sock.close()
+                    return
                 try:
                     remote_sock = self.net_mgr.create_bound_socket(iface, host, port, timeout=12.0, use_ssl=False)
                     self._optimize_socket(remote_sock)
@@ -161,9 +171,16 @@ class MultiWANProxyServer:
                     client_sock.close()
             else:
                 # Plain HTTP Proxying
-                parsed = urlsplit(target)
-                host = parsed.hostname
-                port = parsed.port or 80
+                try:
+                    parsed = urlsplit(target)
+                    host = parsed.hostname
+                    port = parsed.port or 80
+                    if port < 1 or port > 65535:
+                        raise ValueError("Destination port must be between 1 and 65535")
+                except ValueError:
+                    client_sock.sendall(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nInvalid proxy URL/port\r\n")
+                    client_sock.close()
+                    return
 
                 if not host:
                     # Look in Host header
