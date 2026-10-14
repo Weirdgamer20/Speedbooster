@@ -378,7 +378,9 @@ def safe_request_get(
     # Enforce safe proxy policy: disable unverified environment proxy inheritance
     session.trust_env = trust_env
 
-    # If explicit proxies are supplied in kwargs or session, validate proxy destination against SSRF
+    # Requests' proxy manager creates a different connection path and cannot guarantee
+    # that the validated destination IP is the actual peer. Validate configured proxy URLs
+    # for a clear diagnostic, then reject proxy routing in this strict SSRF-safe helper.
     proxies = kwargs.get("proxies") or session.proxies or {}
     for scheme, proxy_url in proxies.items():
         if proxy_url:
@@ -387,6 +389,10 @@ def safe_request_get(
                 raise requests.exceptions.RequestException(
                     f"SSRF violation: Prohibited proxy configuration for {scheme} ({proxy_url}): {p_err}"
                 )
+    if any(proxies.values()):
+        raise requests.exceptions.RequestException(
+            "Proxy routing is unsupported in SSRF-safe mode because it bypasses direct destination-IP pinning."
+        )
 
     current_url = url
     for hop in range(max_redirects + 1):
