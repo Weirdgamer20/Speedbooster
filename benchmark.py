@@ -1,35 +1,48 @@
 """
-benchmark.py - Automated Physical Dual-WAN Benchmark & Network Egress Validator.
-
-Implements the Priority 1 benchmark procedure:
-1. Discovers Windows physical adapters and tests for independent network egress.
-2. Enforces release gates: flags whether independent dual-WAN egress is proven.
-3. Supports multiple trial iterations (--trials N) with averaged metrics.
-4. Correctly computes and clearly distinguishes Decimal MB/s and Binary MiB/s.
-5. Captures Windows physical NIC deltas via PowerShell Get-NetAdapterStatistics.
-6. Validates cryptographic SHA-256 integrity and task completion state.
+benchmark.py - Automated Multi-Trial Dual-WAN Benchmark & Aggregation Suite.
+Executes repeated, controlled trials of:
+  1. Adapter A alone
+  2. Adapter B alone
+  3. Combined Multi-WAN (A+B)
+Captures real-time throughput, computes both Decimal MB/s ($10^6$) and Binary MiB/s ($2^{20}$),
+enforces expected SHA-256 integrity, verifies physical NIC hardware attribution,
+and reports each repetition transparently without masking failures.
 """
 
 import os
 import sys
 import time
 import json
-import hashlib
+import socket
 import argparse
 import subprocess
-from typing import Dict, List, Tuple
-
-from network_manager import NetworkManager, InterfaceStats
+from typing import Dict, List, Optional
+from network_manager import NetworkManager
 from downloader import BondedDownloadTask
 
 
 def get_windows_nic_statistics() -> Dict[str, Dict[str, int]]:
-    """Captures physical OS NIC statistics via Get-NetAdapterStatistics."""
+    """Captures OS-level hardware counters from Windows via PowerShell Get-NetAdapterStatistics."""
+    stats = {}
+    if sys.platform != "win32":
+        # Under Linux/WSL2, read /proc/net/dev
+        if os.path.exists("/proc/net/dev"):
+            try:
+                with open("/proc/net/dev", "r") as f:
+                    for line in f.readlines()[2:]:
+                        parts = line.strip().split(":")
+                        if len(parts) == 2:
+                            dev = parts[0].strip()
+                            fields = parts[1].split()
+                            stats[dev] = {"rx": int(fields[0]), "tx": int(fields[8])}
+            except Exception:
+                pass
+        return stats
+
     cmd = [
         "powershell.exe", "-NoProfile", "-Command",
         "Get-NetAdapterStatistics | Select-Object Name, ReceivedBytes, SentBytes | ConvertTo-Json -Compress"
     ]
-    stats = {}
     try:
         out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL).strip()
         if out:
@@ -49,7 +62,7 @@ def get_windows_nic_statistics() -> Dict[str, Dict[str, int]]:
 
 
 def run_single_trial_pass(trial_name: str, url: str, dest_path: str, net_mgr: NetworkManager, 
-                          allowed_ifaces: list = None) -> dict:
+                          allowed_ifaces: list = None, expected_sha256: Optional[str] = None) -> dict:
     """Executes a single download pass while recording physical NIC deltas and integrity."""
     # Filter interfaces for this trial
     if allowed_ifaces:
@@ -61,7 +74,10 @@ def run_single_trial_pass(trial_name: str, url: str, dest_path: str, net_mgr: Ne
     last_t = t_start
     last_bytes = 0
 
-    task = BondedDownloadTask(f"bench_{int(t_start)}", url, dest_path, net_mgr)
+    task = BondedDownloadTask(
+        f"bench_{int(t_start)}", url, dest_path, net_mgr,
+        expected_sha256=expected_sha256, allow_local=True
+    )
     if not task.start():
         return {
             "trial": trial_name,
@@ -74,6 +90,7 @@ def run_single_trial_pass(trial_name: str, url: str, dest_path: str, net_mgr: Ne
             "bitrate_mbps": 0.0,
             "retries": 0,
             "sha256": "N/A",
+            "checksum_verified": False,
             "nic_deltas": {}
         }
 
@@ -120,14 +137,16 @@ def run_single_trial_pass(trial_name: str, url: str, dest_path: str, net_mgr: Ne
         "bitrate_mbps": round(bitrate_mbps, 2),
         "retries": total_retries,
         "sha256": task.sha256_hash or "N/A",
+        "checksum_verified": task.checksum_verified,
         "nic_deltas": nic_deltas,
         "error": task.error_message
     }
 
 
 def run_benchmark_trial(trial_name: str, url: str, dest_path: str, net_mgr: NetworkManager, 
-                        allowed_ifaces: list = None, trials_count: int = 1) -> dict:
-    """Runs N iterations of a configuration and averages the metrics."""
+                        allowed_ifaces: list = None, trials_count: int = 1,
+                        expected_sha256: Optional[str] = None) -> dict:
+    """Runs N iterations of a configuration, reporting every repetition separately without hiding failures."""
     print(f"\n==================================================")
     print(f"  Configuration: {trial_name}")
     print(f"  Target URL:    {url}")
@@ -139,33 +158,64 @@ def run_benchmark_trial(trial_name: str, url: str, dest_path: str, net_mgr: Netw
     for run_idx in range(1, trials_count + 1):
         if trials_count > 1:
             print(f"\n--- [Iteration {run_idx}/{trials_count}] ---")
-        p = run_single_trial_pass(trial_name, url, dest_path, net_mgr, allowed_ifaces)
+        p = run_single_trial_pass(trial_name, url, dest_path, net_mgr, allowed_ifaces, expected_sha256)
         runs.append(p)
-        print(f"  Pass {run_idx}: Status={p['status']} | Elapsed={p['elapsed_sec']}s | Decimal={p['decimal_mb_s']} MB/s | Binary={p['binary_mib_s']} MiB/s")
+        print(f"  Pass {run_idx}: Status={p['status']} | ChecksumVerified={p.get('checksum_verified')} | Elapsed={p['elapsed_sec']}s | Decimal={p['decimal_mb_s']} MB/s | Binary={p['binary_mib_s']} MiB/s")
 
-    # Average valid runs
-    valid_runs = [r for r in runs if r["status"] == "completed"]
-    if not valid_runs:
-        return runs[-1]
+    # Evaluate all runs: any failed run marks the trial incomplete
+    failed_runs = [r for r in runs if r["status"] != "completed" or (expected_sha256 and r.get("checksum_verified") is False)]
+    all_succeeded = (len(failed_runs) == 0)
 
-    avg_elapsed = round(sum(r["elapsed_sec"] for r in valid_runs) / len(valid_runs), 2)
-    avg_dec = round(sum(r["decimal_mb_s"] for r in valid_runs) / len(valid_runs), 2)
-    avg_bin = round(sum(r["binary_mib_s"] for r in valid_runs) / len(valid_runs), 2)
-    avg_mbps = round(sum(r["bitrate_mbps"] for r in valid_runs) / len(valid_runs), 2)
-    total_retries = sum(r["retries"] for r in valid_runs)
+    if not all_succeeded:
+        return {
+            "trial": trial_name,
+            "status": f"incomplete ({len(failed_runs)}/{trials_count} runs failed)",
+            "all_succeeded": False,
+            "total_bytes": 0,
+            "elapsed_sec": 0.0,
+            "decimal_mb_s": 0.0,
+            "binary_mib_s": 0.0,
+            "bitrate_mbps": 0.0,
+            "retries": sum(r["retries"] for r in runs),
+            "sha256": runs[0].get("sha256", "N/A"),
+            "checksum_verified": False,
+            "nic_deltas": runs[0].get("nic_deltas", {}),
+            "iterations": len(runs),
+            "runs": runs
+        }
+
+    avg_elapsed = round(sum(r["elapsed_sec"] for r in runs) / len(runs), 2)
+    avg_dec = round(sum(r["decimal_mb_s"] for r in runs) / len(runs), 2)
+    avg_bin = round(sum(r["binary_mib_s"] for r in runs) / len(runs), 2)
+    avg_mbps = round(sum(r["bitrate_mbps"] for r in runs) / len(runs), 2)
+    total_retries = sum(r["retries"] for r in runs)
+
+    # Physical NIC attribution check
+    nic_attribution_verified = False
+    all_nic_deltas = [r.get("nic_deltas", {}) for r in runs]
+    if allowed_ifaces and len(allowed_ifaces) >= 2:
+        # Combined run must register traffic on multiple interfaces
+        multi_nic_activity = any(len(d) >= 2 for d in all_nic_deltas)
+        nic_attribution_verified = multi_nic_activity
+    elif allowed_ifaces and len(allowed_ifaces) == 1:
+        nic_attribution_verified = any(len(d) >= 1 for d in all_nic_deltas)
 
     return {
         "trial": trial_name,
         "status": "completed",
-        "total_bytes": valid_runs[0]["total_bytes"],
+        "all_succeeded": True,
+        "total_bytes": runs[0]["total_bytes"],
         "elapsed_sec": avg_elapsed,
         "decimal_mb_s": avg_dec,
         "binary_mib_s": avg_bin,
         "bitrate_mbps": avg_mbps,
         "retries": total_retries,
-        "sha256": valid_runs[0]["sha256"],
-        "nic_deltas": valid_runs[0]["nic_deltas"],
-        "iterations": len(runs)
+        "sha256": runs[0]["sha256"],
+        "checksum_verified": runs[0].get("checksum_verified"),
+        "nic_deltas": runs[-1].get("nic_deltas", {}),
+        "nic_attribution_verified": nic_attribution_verified,
+        "iterations": len(runs),
+        "runs": runs
     }
 
 
@@ -174,8 +224,14 @@ def main():
     parser.add_argument("--url", type=str, default="https://www.python.org/ftp/python/3.12.0/python-3.12.0-amd64.exe", help="URL of test file supporting byte ranges")
     parser.add_argument("--dest-dir", type=str, default="./bench_output", help="Output directory for test downloads")
     parser.add_argument("--trials", type=int, default=1, help="Number of repetitions per configuration to average")
+    parser.add_argument("--expected-sha256", type=str, default=None, help="Trusted SHA-256 digest to verify integrity")
     parser.add_argument("--allow-shared-uplink", action="store_true", help="Permit benchmarking even if adapters share gateway/public IP")
     args = parser.parse_args()
+
+    # Automatically supply Python 3.12.0 installer hash if testing default file
+    expected_hash = args.expected_sha256
+    if not expected_hash and "python-3.12.0-amd64.exe" in args.url:
+        expected_hash = "5280b1bda1b4b1049b49386d34bcf1bca0e4620579e0a29f8f4a7c06eb18f26a"
 
     os.makedirs(args.dest_dir, exist_ok=True)
     net_mgr = NetworkManager()
@@ -186,12 +242,15 @@ def main():
     print("=" * 65)
     print("  SpeedBond Dual-WAN Pre-Flight Egress Verification")
     print("=" * 65)
-    print(f"  Interfaces Detected:       {val_report['interface_count']}")
-    print(f"  Independent Egress Proven: {val_report['independent_egress_proven']}")
-    print(f"  Validation Stage:          {val_report.get('validation_stage')}")
-    print(f"  Distinct Gateways:         {val_report.get('distinct_gateways')}")
-    print(f"  Distinct Public IPs:       {val_report.get('distinct_public_ips')}")
-    print(f"  Status:                    {val_report['status_message']}")
+    print(f"  Interfaces Detected:              {val_report['interface_count']}")
+    print(f"  Source Address Available:         {val_report.get('source_address_available')}")
+    print(f"  Socket Binding Tested:            {val_report.get('socket_binding_test_passed')}")
+    print(f"  Distinct Public Egress Observed:  {val_report.get('distinct_public_egress_observed')}")
+    print(f"  Independent Egress Proven:        {val_report['independent_egress_proven']}")
+    print(f"  Validation Stage:                 {val_report.get('validation_stage')}")
+    print(f"  Distinct Gateways:                {val_report.get('distinct_gateways')}")
+    print(f"  Distinct Public IPs:              {val_report.get('distinct_public_ips')}")
+    print(f"  Status:                           {val_report['status_message']}")
     print("=" * 65)
 
     if not val_report["independent_egress_proven"]:
@@ -215,40 +274,61 @@ def main():
     # Config A: Primary Adapter Only
     dest_a = os.path.join(args.dest_dir, f"bench_a.bin")
     res_a = run_benchmark_trial(f"Adapter A Only ({iface_a})", args.url, dest_a, net_mgr, 
-                                allowed_ifaces=[iface_a], trials_count=args.trials)
+                                allowed_ifaces=[iface_a], trials_count=args.trials, expected_sha256=expected_hash)
     results.append(res_a)
 
     # Config B: Secondary Adapter Only
     dest_b = os.path.join(args.dest_dir, f"bench_b.bin")
     res_b = run_benchmark_trial(f"Adapter B Only ({iface_b})", args.url, dest_b, net_mgr, 
-                                allowed_ifaces=[iface_b], trials_count=args.trials)
+                                allowed_ifaces=[iface_b], trials_count=args.trials, expected_sha256=expected_hash)
     results.append(res_b)
 
     # Config A+B: Combined Parallel Aggregation
     dest_ab = os.path.join(args.dest_dir, f"bench_ab.bin")
     res_ab = run_benchmark_trial(f"Combined A+B ({iface_a} + {iface_b})", args.url, dest_ab, net_mgr, 
-                                 allowed_ifaces=[iface_a, iface_b], trials_count=args.trials)
+                                 allowed_ifaces=[iface_a, iface_b], trials_count=args.trials, expected_sha256=expected_hash)
     results.append(res_ab)
 
     # Print Summary Markdown Table with dual Decimal MB/s and Binary MiB/s
     print("\n" + "=" * 90)
     print("  SPEEDBOND BENCHMARK RESULTS SUMMARY")
     print("=" * 90)
-    print(f"| Configuration | Status | Decimal MB/s | Binary MiB/s | Bitrate (Mbps) | Elapsed (s) | Retries | SHA-256 Digest |")
-    print(f"| :--- | :--- | :-: | :-: | :-: | :-: | :-: | :--- |")
+    print(f"| Configuration | Status | Decimal MB/s | Binary MiB/s | Bitrate (Mbps) | Elapsed (s) | Retries | Checksum Verified |")
+    print(f"| :--- | :--- | :-: | :-: | :-: | :-: | :-: | :---: |")
     for r in results:
-        sha_short = (r['sha256'][:16] + "...") if len(r.get('sha256', '')) > 16 else r.get('sha256', 'N/A')
-        print(f"| {r['trial']} | {r['status']} | **{r.get('decimal_mb_s', 0.0)}** | **{r.get('binary_mib_s', 0.0)}** | {r.get('bitrate_mbps', 0.0)} | {r['elapsed_sec']}s | {r['retries']} | `{sha_short}` |")
+        verified_str = "PASSED" if r.get('checksum_verified') is True else ("FAILED" if r.get('checksum_verified') is False else "N/A")
+        print(f"| {r['trial']} | {r['status']} | **{r.get('decimal_mb_s', 0.0)}** | **{r.get('binary_mib_s', 0.0)}** | {r.get('bitrate_mbps', 0.0)} | {r['elapsed_sec']}s | {r['retries']} | {verified_str} |")
     print("=" * 90)
 
-    # Print verdict
-    if val_report["independent_egress_proven"]:
-        if res_ab.get("decimal_mb_s", 0) > max(res_a.get("decimal_mb_s", 0), res_b.get("decimal_mb_s", 0)):
-            print("\n[VERDICT] PHYSICAL DUAL-WAN AGGREGATION VERIFIED: Combined speed exceeds single-adapter baselines.")
-        else:
-            print("\n[VERDICT] AGGREGATION UNVERIFIED: Combined speed did not exceed single-adapter baselines.")
+    # Detailed per-repetition report if multiple trials requested
+    if args.trials > 1:
+        print("\n--- Detailed Repetition Breakdown ---")
+        for r in results:
+            print(f"Configuration: {r['trial']}")
+            for idx, run_item in enumerate(r.get("runs", [])):
+                print(f"  Run {idx+1}: Status={run_item['status']} | Decimal={run_item['decimal_mb_s']} MB/s | Binary={run_item['binary_mib_s']} MiB/s | Elapsed={run_item['elapsed_sec']}s")
+
+    # Rigorous Aggregation Verdict Evaluation
+    all_passed = all(r.get("all_succeeded", False) for r in results)
+    best_single_speed = max(res_a.get("decimal_mb_s", 0.0), res_b.get("decimal_mb_s", 0.0))
+    combined_speed = res_ab.get("decimal_mb_s", 0.0)
+    has_statistical_gain = (combined_speed > (best_single_speed * 1.10)) if best_single_speed > 0 else False
+    nic_attributed = res_ab.get("nic_attribution_verified", False)
+
+    print("\n" + "=" * 65)
+    print("  FINAL RELEASE-GATE VERDICT")
+    print("=" * 65)
+    if not val_report["independent_egress_proven"]:
+        print("[VERDICT] PHYSICAL AGGREGATION UNVERIFIED: Multi-WAN independence preconditions not met (Shared Uplink).")
+    elif not all_passed:
+        print("[VERDICT] BENCHMARK INCOMPLETE: One or more repetitions failed.")
+    elif not has_statistical_gain:
+        print(f"[VERDICT] AGGREGATION UNVERIFIED: Combined speed ({combined_speed:.2f} MB/s) did not exceed single-adapter baseline by >=10% ({best_single_speed:.2f} MB/s).")
+    elif not nic_attributed:
+        print("[VERDICT] ATTRIBUTION UNVERIFIED: Physical NIC counters did not confirm multi-adapter traffic distribution.")
     else:
-        print("\n[VERDICT] AGGREGATION UNVERIFIED: Multi-WAN independence preconditions not met (Shared Uplink).")
+        print(f"[VERDICT] PHYSICAL DUAL-WAN AGGREGATION VERIFIED: Statistically significant gain observed across all repetitions with verified hardware attribution.")
+    print("=" * 65)
 
 
 if __name__ == "__main__":

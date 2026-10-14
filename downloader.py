@@ -18,6 +18,7 @@ import requests
 from urllib.parse import urlparse
 from typing import Dict, List, Optional, Callable, Tuple
 from network_manager import NetworkManager, InterfaceStats
+from security_utils import safe_request_get, validate_url_ssrf
 
 logger = logging.getLogger("speedbond.downloader")
 
@@ -44,7 +45,8 @@ class DownloadChunk:
 
 class BondedDownloadTask:
     def __init__(self, task_id: str, url: str, dest_path: str, net_mgr: NetworkManager, 
-                 workers_per_iface: int = 2, expected_sha256: Optional[str] = None):
+                 workers_per_iface: int = 2, expected_sha256: Optional[str] = None,
+                 allow_local: Optional[bool] = None):
         self.task_id = task_id
         self.url = url
         self.dest_path = os.path.abspath(dest_path)
@@ -52,6 +54,10 @@ class BondedDownloadTask:
         self.net_mgr = net_mgr
         self.workers_per_iface = workers_per_iface
         self.expected_sha256: Optional[str] = expected_sha256
+        if allow_local is not None:
+            self.allow_local = allow_local
+        else:
+            self.allow_local = (os.environ.get("ALLOW_LOCAL_TEST_DOWNLOADS") == "1")
 
         self.total_size = 0
         self.supports_ranges = False
@@ -92,6 +98,14 @@ class BondedDownloadTask:
         resource validators (ETag / Last-Modified).
         """
         self.status = "probing"
+
+        # Pre-flight SSRF target check
+        is_valid, ssrf_err, _ = validate_url_ssrf(self.url, allow_local=self.allow_local)
+        if not is_valid:
+            self.error_message = f"SSRF blocked: {ssrf_err}"
+            self.status = "failed"
+            return False
+
         active_ifaces = [i for i in self.net_mgr.interfaces.values() if i.is_active]
         if not active_ifaces:
             self.error_message = "No active network interfaces available"
@@ -109,7 +123,7 @@ class BondedDownloadTask:
             try:
                 # Custom socket adapter / session for bound iface
                 session = self.net_mgr.create_requests_session(iface.name)
-                resp = session.get(self.url, headers=headers, timeout=(6.0, 10.0), stream=True)
+                resp = safe_request_get(session, self.url, allow_local=self.allow_local, headers=headers, timeout=(6.0, 10.0), stream=True)
 
                 if resp.status_code == 206:
                     # Valid partial content response: require full-match Content-Range and verify length
@@ -127,6 +141,8 @@ class BondedDownloadTask:
                             return True
                         else:
                             logger.warning("Probe received invalid slice body length (%d) or total (%d)", len(probe_body), total)
+                    else:
+                        logger.warning("Probe received malformed Content-Range header: '%s'", content_range)
                 elif resp.status_code == 200:
                     # Server ignored Range header and returned full body
                     cl = resp.headers.get("Content-Length")
@@ -258,7 +274,7 @@ class BondedDownloadTask:
         if self.etag:
             req_headers["If-Range"] = self.etag
 
-        resp = session.get(self.url, headers=req_headers, timeout=(10.0, 20.0), stream=True)
+        resp = safe_request_get(session, self.url, allow_local=self.allow_local, headers=req_headers, timeout=(10.0, 20.0), stream=True)
 
         try:
             # Strictly reject 200 OK for range chunk requests
@@ -326,20 +342,26 @@ class BondedDownloadTask:
         def _stream():
             self.status = "running"
             self.start_time = time.time()
-            active = [i for i in self.net_mgr.interfaces.values() if i.is_active]
-            if not active:
-                self.error_message = "No active interfaces for single-stream fallback"
-                self.status = "failed"
-                return
-
-            ifstat = active[0]
-            session = self.net_mgr.create_requests_session(ifstat.name)
-
             try:
-                resp = session.get(self.url, headers={"User-Agent": "SpeedBond/2.0"}, timeout=(10.0, 30.0), stream=True)
+                active = [i for i in self.net_mgr.interfaces.values() if i.is_active]
+                if not active:
+                    with self._state_lock:
+                        self.error_message = "No active interfaces for single-stream fallback"
+                        self.status = "failed"
+                    self._cancel_event.set()
+                    self._notify()
+                    return
+
+                ifstat = active[0]
+                session = self.net_mgr.create_requests_session(ifstat.name)
+
+                resp = safe_request_get(session, self.url, allow_local=self.allow_local, headers={"User-Agent": "SpeedBond/2.0"}, timeout=(10.0, 30.0), stream=True)
                 if resp.status_code != 200:
-                    self.error_message = f"Single stream returned HTTP {resp.status_code}"
-                    self.status = "failed"
+                    with self._state_lock:
+                        self.error_message = f"Single stream returned HTTP {resp.status_code}"
+                        self.status = "failed"
+                    self._cancel_event.set()
+                    self._notify()
                     return
 
                 with open(self.temp_path, "wb") as f:
@@ -355,8 +377,12 @@ class BondedDownloadTask:
                 resp.close()
                 self._finalize_file()
             except Exception as e:
-                self.error_message = f"Single stream error: {e}"
-                self.status = "failed"
+                logger.error("Single stream fallback error: %s", e)
+                with self._state_lock:
+                    self.error_message = f"Single stream error: {e}"
+                    self.status = "failed"
+                self._cancel_event.set()
+                self._notify()
 
         t = threading.Thread(target=_stream, daemon=True)
         t.start()
@@ -437,12 +463,20 @@ class BondedDownloadTask:
             else:
                 self.checksum_verified = None
 
-            # 4. Atomic rename
+            # 4. Atomic rename guarded by cancellation state
+            with self._state_lock:
+                if self._cancel_event.is_set() or self.status in ("failed", "cancelled"):
+                    logger.warning("Task was cancelled or failed during finalization; not completing.")
+                    return
+
             if os.path.exists(self.dest_path):
                 os.remove(self.dest_path)
             os.rename(self.temp_path, self.dest_path)
 
             with self._state_lock:
+                if self._cancel_event.is_set() or self.status in ("failed", "cancelled"):
+                    logger.warning("Task was cancelled or failed after move; not completing.")
+                    return
                 self.status = "completed"
                 self.end_time = time.time()
             self._notify()

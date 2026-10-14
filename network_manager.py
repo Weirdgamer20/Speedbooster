@@ -215,22 +215,43 @@ class BoundInterfaceHTTPAdapter(HTTPAdapter):
 
         super().init_poolmanager(connections, maxsize, block=block, **pool_kwargs)
 
+    def verify_socket_binding(self) -> Tuple[bool, str]:
+        """
+        Independently verifies at the socket layer that an outbound socket can be created
+        and bound to the configured interface and source address before traffic is routed.
+        """
+        s = None
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(2.0)
+            if sys.platform.startswith("linux") and hasattr(socket, "SO_BINDTODEVICE"):
+                if self.ifname and self.ifname not in ["lo", "127.0.0.1", "loopback"]:
+                    s.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_BINDTODEVICE", 25), self.ifname.encode() + b"\0")
+            elif sys.platform == "win32" and self.if_index > 0:
+                import struct
+                s.setsockopt(socket.IPPROTO_IP, getattr(socket, "IP_UNICAST_IF", 31), struct.pack("!I", self.if_index))
+            if self.source_ip:
+                s.bind((self.source_ip, 0))
+            return True, "Socket binding verified"
+        except Exception as e:
+            return False, f"Socket binding verification failed on '{self.ifname}': {e}"
+        finally:
+            if s:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+
     def send(self, request, **kwargs):
         """Wraps send to ensure socket-level interface or source-address binding failures fail closed."""
         try:
             return super().send(request, **kwargs)
-        except Exception as e:
-            err_str = str(e).lower()
-            if (
-                "cannot assign requested address" in err_str
-                or "no such device" in err_str
-                or "invalid argument" in err_str
-                or "bind" in err_str
-            ):
-                raise InterfaceBindingError(
-                    f"Interface socket binding failed on '{self.ifname}' (IP: {self.source_ip}): {e}"
-                ) from e
+        except InterfaceBindingError:
             raise
+        except (requests.exceptions.ConnectionError, requests.exceptions.ConnectTimeout, OSError, socket.error) as e:
+            raise InterfaceBindingError(
+                f"Interface socket binding or connection failed on '{self.ifname}' (IP: {self.source_ip}): {e}"
+            ) from e
 
 
 class NetworkManager:
@@ -344,52 +365,80 @@ class NetworkManager:
                     except Exception:
                         pass
                 results.append({"name": ifname, "ip": ip, "gateway": gateway_map.get(ifname, ""), "mac": mac, "desc": "", "if_index": if_idx})
-            self._ensure_linux_policy_routing(results)
         except Exception as e:
             logger.warning("Linux interface discovery failed: %s", e)
         return results
 
-    def _ensure_linux_policy_routing(self, interfaces: List[dict]):
+    def configure_linux_policy_routing(self, apply: bool = False, rollback: bool = False) -> Dict[str, Any]:
         """
-        Configures Linux source-based policy routing (tables 101, 102, ...)
-        safely and non-intrusively without blocking on interactive credentials.
+        Explicit, opt-in configuration for Linux source-based policy routing (tables 101, 102, ...).
+        When apply=False and rollback=False: returns a preview plan (dry run).
+        When apply=True: applies routing rules non-interactively.
+        When rollback=True: removes rules.
+        Interface discovery never invokes this method automatically.
         """
-        if not sys.platform.startswith("linux") or len(interfaces) < 2:
-            return
+        if not sys.platform.startswith("linux"):
+            return {"supported": False, "reason": "Not running on Linux/WSL2"}
+
+        active = [i for i in self.interfaces.values() if i.is_active and i.ip and i.gateway]
+        if len(active) < 2:
+            return {"supported": False, "reason": "Requires at least 2 active interfaces with IP and gateway"}
 
         try:
             rule_out = subprocess.check_output(["ip", "rule", "show"], text=True, stderr=subprocess.DEVNULL, timeout=3)
         except Exception:
             rule_out = ""
 
+        plan = []
         is_root = os.geteuid() == 0 if hasattr(os, "geteuid") else False
         sudo_prefix = [] if is_root else ["sudo", "-n"]
 
-        for idx, iface in enumerate(interfaces):
-            ip = iface.get("ip")
-            name = iface.get("name")
-            gw = iface.get("gateway")
-            if not ip or not name or not gw:
-                continue
+        for idx, ifstat in enumerate(active):
             table_id = 101 + idx
-            if f"from {ip} lookup {table_id}" in rule_out:
-                continue
+            rule_desc = f"from {ifstat.ip} lookup {table_id}"
+            route_desc = f"default via {ifstat.gateway} dev {ifstat.name} table {table_id}"
+            already_applied = rule_desc in rule_out
 
-            try:
-                res = subprocess.run(
-                    sudo_prefix + ["ip", "rule", "add", "from", ip, "table", str(table_id)],
-                    check=False, capture_output=True, timeout=3
-                )
-                if res.returncode == 0:
-                    subprocess.run(
-                        sudo_prefix + ["ip", "route", "add", "default", "via", gw, "dev", name, "table", str(table_id)],
+            plan.append({
+                "interface": ifstat.name,
+                "ip": ifstat.ip,
+                "gateway": ifstat.gateway,
+                "table_id": table_id,
+                "rule": rule_desc,
+                "route": route_desc,
+                "already_applied": already_applied
+            })
+
+            if apply and not already_applied:
+                try:
+                    res = subprocess.run(
+                        sudo_prefix + ["ip", "rule", "add", "from", ifstat.ip, "table", str(table_id)],
                         check=False, capture_output=True, timeout=3
                     )
-                    logger.info("Configured Linux policy routing: table %d for %s (IP %s via %s)", table_id, name, ip, gw)
-                else:
-                    logger.debug("Policy routing setup skipped (non-root / credentials required): %s", name)
-            except Exception as e:
-                logger.debug("Could not configure policy routing for %s: %s", name, e)
+                    if res.returncode == 0:
+                        subprocess.run(
+                            sudo_prefix + ["ip", "route", "add", "default", "via", ifstat.gateway, "dev", ifstat.name, "table", str(table_id)],
+                            check=False, capture_output=True, timeout=3
+                        )
+                        logger.info("Applied policy route: %s via %s (table %d)", ifstat.ip, ifstat.gateway, table_id)
+                except Exception as e:
+                    logger.warning("Failed to apply policy route for %s: %s", ifstat.name, e)
+
+            elif rollback and already_applied:
+                try:
+                    subprocess.run(
+                        sudo_prefix + ["ip", "rule", "del", "from", ifstat.ip, "table", str(table_id)],
+                        check=False, capture_output=True, timeout=3
+                    )
+                    subprocess.run(
+                        sudo_prefix + ["ip", "route", "flush", "table", str(table_id)],
+                        check=False, capture_output=True, timeout=3
+                    )
+                    logger.info("Rolled back policy route for table %d", table_id)
+                except Exception as e:
+                    logger.warning("Failed to rollback policy route for %s: %s", ifstat.name, e)
+
+        return {"supported": True, "applied": apply, "rollback": rollback, "plan": plan}
 
     def discover_interfaces(self) -> List[InterfaceStats]:
         """
@@ -503,12 +552,27 @@ class NetworkManager:
 
         # Multi-stage evaluation
         interfaces_discovered = (len(active) >= 2)
-        binding_verified = bool(active and all(i.ip for i in active))
-        public_egress_observed = bool(active and all(i.public_ip and i.public_ip != "N/A" for i in active))
+        source_address_available = bool(active and all(i.ip for i in active))
 
-        # P0 CRITICAL RULE: Independent egress requires distinct PUBLIC IPs.
-        # A distinct gateway alone does NOT prove independent WAN uplinks.
-        independent_egress_proven = (len(distinct_public_ips) >= 2 and len(active) >= 2)
+        # Test socket binding on active interfaces to prove OS socket capability
+        socket_binding_test_passed = False
+        if source_address_available:
+            passed_all = True
+            for ifstat in active:
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    s.bind((ifstat.ip, 0))
+                    s.close()
+                except Exception:
+                    passed_all = False
+                    break
+            socket_binding_test_passed = passed_all
+
+        public_egress_observed = bool(active and all(i.public_ip and i.public_ip != "N/A" for i in active))
+        distinct_public_egress_observed = (len(distinct_public_ips) >= 2 and len(active) >= 2)
+        independent_egress_proven = distinct_public_egress_observed
+        physical_nic_attribution_verified = False  # Updated when NIC hardware counters confirm distinct physical routing
+        combined_throughput_gain_verified = False  # Updated when multi-trial benchmark exceeds baselines
 
         if len(active) < 2:
             stage = "single_interface" if len(active) == 1 else "no_egress"
@@ -532,8 +596,13 @@ class NetworkManager:
         return {
             "interface_count": len(active),
             "interfaces_discovered": interfaces_discovered,
-            "binding_verified": binding_verified,
+            "source_address_available": source_address_available,
+            "socket_binding_test_passed": socket_binding_test_passed,
+            "binding_verified": source_address_available,  # Maintained for backwards compatibility
             "public_egress_observed": public_egress_observed,
+            "distinct_public_egress_observed": distinct_public_egress_observed,
+            "physical_nic_attribution_verified": physical_nic_attribution_verified,
+            "combined_throughput_gain_verified": combined_throughput_gain_verified,
             "distinct_gateways": sorted(list(distinct_gateways)),
             "distinct_public_ips": sorted(list(distinct_public_ips)),
             "independent_egress_proven": independent_egress_proven,

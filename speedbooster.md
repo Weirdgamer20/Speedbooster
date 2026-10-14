@@ -379,50 +379,56 @@ platform linux -- Python 3.14.4, pytest-9.0.2, pluggy-1.6.0 -- /usr/bin/python3
 cachedir: .pytest_cache
 rootdir: /home/tg/speedbond
 plugins: typeguard-4.4.4
-collecting ... collected 19 items
+collecting ... collected 24 items
 
-tests/test_speedbond.py::test_compilation PASSED                         [  5%]
-tests/test_speedbond.py::test_range_success_with_trusted_checksum PASSED [ 10%]
-tests/test_speedbond.py::test_range_checksum_mismatch PASSED             [ 15%]
-tests/test_speedbond.py::test_ignored_range_safe_fallback PASSED         [ 21%]
-tests/test_speedbond.py::test_wrong_content_range_rejected PASSED        [ 26%]
-tests/test_speedbond.py::test_oversized_body_rejected PASSED             [ 31%]
-tests/test_speedbond.py::test_truncated_body_rejected PASSED             [ 36%]
-tests/test_speedbond.py::test_incorrect_total_size_rejected PASSED       [ 42%]
-tests/test_speedbond.py::test_etag_mutation_detected PASSED              [ 47%]
-tests/test_speedbond.py::test_cancellation_and_worker_termination PASSED [ 52%]
-tests/test_speedbond.py::test_binding_failure_reported PASSED            [ 57%]
-tests/test_speedbond.py::test_refresh_api_real_http_post PASSED          [ 63%]
-tests/test_speedbond.py::test_path_traversal_actual_http_endpoint PASSED [ 68%]
-tests/test_speedbond.py::test_bound_interface_adapter_socket_options PASSED [ 73%]
-tests/test_speedbond.py::test_physical_adapter_hardware_traffic_isolation PASSED [ 78%]
-tests/test_speedbond.py::test_validate_paths_multistage_logic PASSED     [ 84%]
-tests/test_speedbond.py::test_probe_strict_range_and_malformed_rejection PASSED [ 89%]
-tests/test_speedbond.py::test_worker_setup_failure_transitions_to_failed PASSED [ 94%]
+tests/test_speedbond.py::test_compilation PASSED                         [  4%]
+tests/test_speedbond.py::test_range_success_with_trusted_checksum PASSED [  8%]
+tests/test_speedbond.py::test_range_checksum_mismatch PASSED             [ 12%]
+tests/test_speedbond.py::test_ignored_range_safe_fallback PASSED         [ 16%]
+tests/test_speedbond.py::test_wrong_content_range_rejected PASSED        [ 20%]
+tests/test_speedbond.py::test_oversized_body_rejected PASSED             [ 25%]
+tests/test_speedbond.py::test_truncated_body_rejected PASSED             [ 29%]
+tests/test_speedbond.py::test_incorrect_total_size_rejected PASSED       [ 33%]
+tests/test_speedbond.py::test_etag_mutation_detected PASSED              [ 37%]
+tests/test_speedbond.py::test_cancellation_and_worker_termination PASSED [ 41%]
+tests/test_speedbond.py::test_binding_failure_reported PASSED            [ 45%]
+tests/test_speedbond.py::test_refresh_api_real_http_post PASSED          [ 50%]
+tests/test_speedbond.py::test_path_traversal_actual_http_endpoint PASSED [ 54%]
+tests/test_speedbond.py::test_bound_interface_adapter_socket_options PASSED [ 58%]
+tests/test_speedbond.py::test_physical_adapter_hardware_traffic_isolation SKIPPED [ 62%]
+tests/test_speedbond.py::test_validate_paths_multistage_logic PASSED     [ 66%]
+tests/test_speedbond.py::test_probe_strict_range_and_malformed_rejection PASSED [ 70%]
+tests/test_speedbond.py::test_worker_setup_failure_transitions_to_failed PASSED [ 75%]
+tests/test_speedbond.py::test_single_stream_session_failure_handled PASSED [ 79%]
+tests/test_speedbond.py::test_finalization_lock_state_transition_race PASSED [ 83%]
+tests/test_speedbond.py::test_ssrf_comprehensive_protection PASSED       [ 87%]
+tests/test_speedbond.py::test_fail_closed_socket_binding_error PASSED    [ 91%]
+tests/test_speedbond.py::test_opt_in_linux_policy_routing PASSED         [ 95%]
 tests/test_speedbond.py::test_api_concurrency_limit_and_ssrf_protection PASSED [100%]
 
-======================== 19 passed in 64.89s (0:01:04) =========================
+=========================== short test summary info ============================
+SKIPPED [1] tests/test_speedbond.py:472: Physical hardware isolation test requires independent egress paths across adapters (current stage: shared_uplink_single_isp). Skipping to avoid overstating dual-adapter isolation.
+======================== 23 passed, 1 skipped in 32.33s ========================
 ```
 
-#### Verified Audit Repairs in v2.1.1
-1. **P0 Multi-Stage Path Validation:**
-   * Rewrote `validate_paths()` in `network_manager.py` to eliminate the permissive shortcut where distinct gateways alone declared `independent_egress_proven = True`.
-   * Multi-stage classification distinguishes `shared_uplink_single_isp` and `distinct_gateways_shared_ip` from `multi_provider_independent`. Only distinct public IPs yield `independent_egress_proven = True`.
-2. **P0 Interface Binding & Fail-Closed Socket Discipline:**
-   * Removed process-global monkey patching of `urllib3.util.connection.create_connection`.
-   * Implemented adapter-specific socket creation via `BoundInterfaceHTTPAdapter(source_ip=...)` and `PoolManager(socket_options=..., source_address=...)`.
-   * Added `SO_BINDTODEVICE` (Linux/WSL2) and `IP_UNICAST_IF` (Windows) pool socket options for link-level hardware egress.
-   * Prohibited silent failure: wrapped `send()` in `BoundInterfaceHTTPAdapter` to catch socket errors and raise explicit `InterfaceBindingError` (`requests.exceptions.RequestException`).
-3. **P1 Downloader Integrity & Concurrency Hardening (RFC 9110):**
-   * Validates HTTP 206 status, Content-Range regex (`^bytes\s+0-1/(\d+)$`), and exact 2-byte slice length during probe.
-   * Serialized finalization with `_finalize_lock` to prevent worker race conditions.
-   * Worker session construction exceptions immediately transition task status to `failed` and signal abort tokens.
-   * Cancellation joins worker threads before temporary files are unlinked.
-4. **P1 Proxy & API Security Hardening:**
-   * Added 128-connection semaphore concurrency limiter in `proxy.py`, with informative DNS/socket error logging; explicitly labeled as per-connection proxy load balancing.
-   * Added SSRF target IP filtering, canonical symlink validation, and 3-task download concurrency throttling (HTTP 429) in `web_server.py`.
-5. **P1 Benchmark Tooling Corrections:**
-   * Fixed progress attribute (`progress_pct`), added dynamic rate calculation, implemented repeated trials averaging (`--trials N`), and formatted dual Decimal MB/s ($10^6$) and Binary MiB/s ($2^{20}$).
+#### Verified Audit Repairs in v2.1.2
+1. **P0 Comprehensive SSRF Defense (`security_utils.py`):**
+   * Pre-flight DNS resolution of all A/AAAA records via `validate_url_ssrf()`. Rejects loopback, RFC 1918, link-local, carrier-grade NAT (`100.64.0.0/10`), multicast, reserved, and IPv4-mapped IPv6 ranges.
+   * Direct inspection and rejection of alternate integer (`2130706433`), hex (`0x7f000001`), and octal representations before resolution.
+   * `safe_request_get()` manually validates every redirect destination (`Location` header) step-by-step, defeating HTTP 3xx redirect pivots.
+2. **P0 Fail-Closed Socket Binding & Verification:**
+   * Removed all fragile string matching on exception texts in `BoundInterfaceHTTPAdapter.send()`. Direct exception handling catches connection/socket failures and raises `InterfaceBindingError`.
+   * Added `verify_socket_binding()` to independently verify socket creation, socket options, and source binding at the socket layer.
+3. **P0 Honest Test Accounting:**
+   * Reconciled test accounting: on shared uplinks (`shared_uplink_single_isp`), `test_physical_adapter_hardware_traffic_isolation` is explicitly recorded as **SKIPPED** (not passed). Recorded test suite result is strictly **23 passed, 1 skipped in 32.33s**.
+4. **Benchmark Suite Reliability:**
+   * `benchmark.py` reports every trial repetition separately; marks configurations incomplete if any repetition fails; verifies SHA-256 against `--expected-sha256`; verifies physical NIC attribution; enforces $\ge 10\%$ speed gain over single baselines.
+5. **Downloader State Machine & Fallback Hardening:**
+   * Probe strictly validates RFC 9110 regex (`^bytes\s+0-1/(\d+)$`) and exact 2-byte body length, rejecting malformed Content-Range (`bytes 0-1/*`) and wrong body lengths.
+   * Single-stream fallback session setup is guarded with try/except, transitioning to `failed` upon error.
+   * State transitions in `_finalize_file()` verify that cancelled or failed tasks can never be overwritten to `completed`.
+6. **Non-Intrusive WSL2 Routing:**
+   * Removed automatic `_ensure_linux_policy_routing()` calls from `discover_interfaces()`, making interface discovery 100% read-only. Added explicit opt-in `configure_linux_policy_routing(apply=False)` with safe dry-run preview.
 
 ---
 

@@ -4,6 +4,19 @@ All notable changes to the SpeedBond project are documented in this file.
 
 ---
 
+## [v2.1.2] — 2026-10-14
+
+### Security & Robustness (GitHub Audit Corrections)
+* **Comprehensive SSRF & Redirect Pivot Defense (P0):** Created centralized `security_utils.py`. Implemented `validate_url_ssrf()` resolving all A/AAAA DNS records and rejecting loopback, RFC 1918, link-local, carrier-grade NAT (`100.64.0.0/10`), multicast, reserved, and IPv4-mapped IPv6 ranges. Added detection and rejection of alternate decimal (`2130706433`), hex (`0x7f000001`), and octal integer IP representations. Implemented `safe_request_get()` with manual step-by-step redirect inspection, defeating HTTP 3xx redirect pivots.
+* **Fail-Closed Socket Binding & Connection Layer Verification (P0):** Eliminated all fragile exception message string searches in `BoundInterfaceHTTPAdapter.send()`. Direct exception handling traps all connection and socket-level errors and raises `InterfaceBindingError`. Added `verify_socket_binding()` to independently verify socket creation, socket options, and source binding at the socket layer.
+* **Transparent Test Accounting (P0):** Reconciled test accounting across all reports and logs. When running on a shared uplink (`shared_uplink_single_isp`), `test_physical_adapter_hardware_traffic_isolation` is explicitly recorded as **SKIPPED** with the exact skip reason logged. Current suite execution records **23 passed, 1 skipped in 32.33s**.
+* **Benchmark Suite Hardening:** `benchmark.py` reports every trial repetition separately; marks configurations incomplete if any repetition fails; verifies SHA-256 against `--expected-sha256`; verifies physical NIC hardware counter attribution; enforces $\ge 10\%$ throughput gain over single-adapter baselines.
+* **Downloader State Machine & Fallback Hardening:** Probe validates strict RFC 9110 regex (`^bytes\s+0-1/(\d+)$`) and exact 2-byte body length, rejecting malformed Content-Range (`bytes 0-1/*`) and mismatched body lengths. Single-stream fallback session creation is guarded with try/except, transitioning to `failed` upon error. State transitions in `_finalize_file()` verify that cancelled or failed tasks can never be overwritten to `completed`.
+* **Non-Intrusive WSL2 Routing:** Removed automatic `_ensure_linux_policy_routing()` calls from `discover_interfaces()`, making interface discovery 100% read-only. Added explicit opt-in `configure_linux_policy_routing(apply=False)` with safe dry-run preview.
+* **Expanded Automated Test Suite (23 Passed, 1 Skipped):** Added tests covering comprehensive SSRF rejection, redirect pivot prevention, fail-closed socket binding, single-stream fallback error transitions, finalization race conditions, malformed probe rejection, and opt-in policy routing.
+
+---
+
 ## [v2.1.1] — 2026-10-14
 
 ### Security & Robustness (GitHub Audit Corrections)

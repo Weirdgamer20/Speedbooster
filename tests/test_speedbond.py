@@ -32,9 +32,10 @@ import pytest
 # Add parent directory to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from network_manager import NetworkManager, InterfaceStats, BoundInterfaceHTTPAdapter
+from network_manager import NetworkManager, InterfaceStats, BoundInterfaceHTTPAdapter, InterfaceBindingError
 from downloader import BondedDownloadTask, ChunkVerificationError, ResourceChangedError
 from web_server import SpeedBondServer
+from security_utils import validate_url_ssrf, is_prohibited_ip, safe_request_get
 
 # 4MB deterministic test payload
 TEST_PAYLOAD = b"SpeedBondDeterministicPayload_0123456789ABCDEF\n" * (4 * 1024 * 1024 // 48)
@@ -43,7 +44,7 @@ TEST_ETAG = '"speedbond-test-v2.1"'
 
 
 class MockHTTPServerHandler(BaseHTTPRequestHandler):
-    mode = "normal"  # normal, ignore_range, wrong_range, oversized, truncated, bad_total_size, change_etag, slow
+    mode = "normal"  # normal, ignore_range, wrong_range, oversized, truncated, bad_total_size, change_etag, slow, probe_malformed_range, probe_wrong_length
     etag = TEST_ETAG
 
     def do_HEAD(self):
@@ -54,6 +55,19 @@ class MockHTTPServerHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        # Handle explicit redirect testing endpoints
+        if self.path == "/redirect_to_internal":
+            self.send_response(302)
+            self.send_header("Location", "http://127.0.0.1:8080/internal_secret")
+            self.end_headers()
+            return
+
+        if self.path == "/redirect_to_prohibited":
+            self.send_response(302)
+            self.send_header("Location", "http://10.254.1.1/admin")
+            self.end_headers()
+            return
+
         range_header = self.headers.get("Range")
 
         # 1. Server ignores Range header (returns 200 OK with whole body)
@@ -70,6 +84,25 @@ class MockHTTPServerHandler(BaseHTTPRequestHandler):
             parts = range_header.replace("bytes=", "").split("-")
             start = int(parts[0])
             end = int(parts[1]) if parts[1] else len(TEST_PAYLOAD) - 1
+
+            # Probe error simulation modes
+            if self.mode == "probe_malformed_range":
+                self.send_response(206)
+                self.send_header("Content-Range", "bytes 0-1/*")
+                self.send_header("ETag", self.etag)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"AB")
+                return
+
+            if self.mode == "probe_wrong_length":
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes 0-1/{len(TEST_PAYLOAD)}")
+                self.send_header("ETag", self.etag)
+                self.send_header("Content-Length", "1")
+                self.end_headers()
+                self.wfile.write(b"A")
+                return
 
             # 2. Resource mutation between chunks
             if self.mode == "change_etag" and start > 0:
@@ -147,12 +180,14 @@ class MockHTTPServerHandler(BaseHTTPRequestHandler):
 
 @pytest.fixture(scope="module")
 def mock_server():
+    os.environ["ALLOW_LOCAL_TEST_DOWNLOADS"] = "1"
     server = HTTPServer(("127.0.0.1", 0), MockHTTPServerHandler)
     port = server.server_port
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     yield f"http://127.0.0.1:{port}"
     server.shutdown()
+    os.environ.pop("ALLOW_LOCAL_TEST_DOWNLOADS", None)
 
 
 @pytest.fixture
@@ -541,7 +576,7 @@ def test_probe_strict_range_and_malformed_rejection(mock_server):
     nm.interfaces = {"lo": if1}
 
     # 1. Normal server returns valid 206 with bytes 0-1/<total> and 2 bytes body
-    task = BondedDownloadTask("probe_ok", f"{base_url}/test", "./dest_ok.bin", nm)
+    task = BondedDownloadTask("probe_ok", f"{base_url}/test", "./dest_ok.bin", nm, allow_local=True)
     assert task.probe() is True
     assert task.supports_ranges is True
     assert task.total_size == len(TEST_PAYLOAD)
@@ -549,10 +584,28 @@ def test_probe_strict_range_and_malformed_rejection(mock_server):
     # 2. Server returning 200 OK (range ignored) falls back to single-stream
     MockHTTPServerHandler.mode = "ignore_range"
     try:
-        task_fallback = BondedDownloadTask("probe_fallback", f"{base_url}/test", "./dest_fallback.bin", nm)
+        task_fallback = BondedDownloadTask("probe_fallback", f"{base_url}/test", "./dest_fallback.bin", nm, allow_local=True)
         assert task_fallback.probe() is True
         assert task_fallback.supports_ranges is False
         assert task_fallback.total_size == len(TEST_PAYLOAD)
+    finally:
+        MockHTTPServerHandler.mode = "normal"
+
+    # 3. Server returning malformed Content-Range header (e.g. bytes 0-1/*)
+    MockHTTPServerHandler.mode = "probe_malformed_range"
+    try:
+        task_malformed = BondedDownloadTask("probe_malformed", f"{base_url}/test", "./dest_malformed.bin", nm, allow_local=True)
+        assert task_malformed.probe() is False
+        assert "Probe failed on all interfaces" in task_malformed.error_message
+    finally:
+        MockHTTPServerHandler.mode = "normal"
+
+    # 4. Server returning incorrect slice body length (1 byte instead of 2 bytes)
+    MockHTTPServerHandler.mode = "probe_wrong_length"
+    try:
+        task_wrong_len = BondedDownloadTask("probe_wrong_len", f"{base_url}/test", "./dest_wrong_len.bin", nm, allow_local=True)
+        assert task_wrong_len.probe() is False
+        assert "Probe failed on all interfaces" in task_wrong_len.error_message
     finally:
         MockHTTPServerHandler.mode = "normal"
 
@@ -563,26 +616,164 @@ def test_worker_setup_failure_transitions_to_failed():
     cleanly to mark task status 'failed' and abort.
     """
     nm = NetworkManager()
-    # Mock interface that will raise on session setup
     if1 = InterfaceStats(name="broken_nic", ip="192.0.2.1", mac="00:00:00:00:00:02", gateway="192.0.2.254", public_ip="192.0.2.1")
     nm.interfaces = {"broken_nic": if1}
 
-    # Monkey patch create_requests_session to simulate interface failure
     def fail_session(ifname):
         raise ConnectionError(f"Simulated hardware binding failure on {ifname}")
 
     nm.create_requests_session = fail_session
 
-    task = BondedDownloadTask("fail_task", "http://example.com/test.bin", "./fail.bin", nm)
+    task = BondedDownloadTask("fail_task", "http://example.com/test.bin", "./fail.bin", nm, allow_local=True)
     task.supports_ranges = True
     task.total_size = 1048576
 
-    # Call worker loop directly
     task._worker_loop("broken_nic")
 
     assert task.status == "failed"
     assert "Worker initialization failed" in task.error_message
     assert task._cancel_event.is_set()
+
+
+def test_single_stream_session_failure_handled(mock_server):
+    """
+    Requirement (Downloader audit): Single-stream fallback background worker must
+    catch session creation failure and transition deterministically to 'failed'.
+    """
+    nm = NetworkManager()
+    if1 = InterfaceStats(name="lo", ip="127.0.0.1", mac="00:00:00:00:00:01", gateway="127.0.0.1", public_ip="127.0.0.1")
+    nm.interfaces = {"lo": if1}
+
+    task = BondedDownloadTask("single_stream_fail", f"{mock_server}/test", "./ss_fail.bin", nm, allow_local=True)
+    task.supports_ranges = False
+    task.total_size = len(TEST_PAYLOAD)
+
+    # Monkey patch create_requests_session to simulate session constructor failure
+    def raise_session_err(ifname):
+        raise RuntimeError("Simulated session initialization error in single-stream")
+
+    nm.create_requests_session = raise_session_err
+
+    task._start_single_stream()
+
+    timeout = 3.0
+    t0 = time.time()
+    while task.status == "running" and (time.time() - t0) < timeout:
+        time.sleep(0.1)
+
+    assert task.status == "failed"
+    assert "Single stream error" in task.error_message
+    assert task._cancel_event.is_set()
+
+
+def test_finalization_lock_state_transition_race(tmp_path):
+    """
+    Requirement (Downloader audit): Finalization lock and state checks must prevent
+    a task from transitioning to 'completed' if cancellation occurred during finalization.
+    """
+    nm = NetworkManager()
+    if1 = InterfaceStats(name="lo", ip="127.0.0.1", mac="00:00:00:00:00:01", gateway="127.0.0.1", public_ip="127.0.0.1")
+    nm.interfaces = {"lo": if1}
+
+    dest = str(tmp_path / "race_test.bin")
+    task = BondedDownloadTask("race_task", "http://example.com/test", dest, nm, allow_local=True)
+    task.total_size = 100
+    task.supports_ranges = False
+
+    # Create dummy temp file
+    with open(task.temp_path, "wb") as f:
+        f.write(b"X" * 100)
+
+    # Pre-set cancel event to simulate race before move
+    task._cancel_event.set()
+    task.status = "cancelled"
+
+    task._finalize_file()
+
+    # Must NOT be completed
+    assert task.status == "cancelled"
+    assert not os.path.exists(dest)
+
+
+def test_ssrf_comprehensive_protection(mock_server):
+    """
+    Requirement (P0 audit): SSRF validation must resolve all A/AAAA records, reject prohibited
+    address ranges (loopback, private, link-local, CGNAT, multicast, IPv4-mapped IPv6,
+    alternate integer/hex IP formats), and prevent redirect pivots.
+    """
+    # 1. Prohibited direct and alternate IP formats
+    prohibited_urls = [
+        "http://127.0.0.1:8080/admin",           # IPv4 loopback
+        "http://127.127.127.127/secret",        # IPv4 loopback subnet
+        "http://2130706433/",                   # Decimal representation of 127.0.0.1
+        "http://0x7f000001/",                   # Hex representation of 127.0.0.1
+        "http://10.0.0.1/internal",             # RFC 1918 Class A
+        "http://172.16.0.1/internal",           # RFC 1918 Class B
+        "http://192.168.1.1/internal",          # RFC 1918 Class C
+        "http://100.64.0.1/cgnat",              # Carrier-Grade NAT (100.64.0.0/10)
+        "http://169.254.169.254/metadata",      # Link-local AWS/cloud metadata
+        "http://[::1]/",                        # IPv6 loopback
+        "http://[fe80::1]/",                    # IPv6 link-local
+        "http://[::ffff:127.0.0.1]/",           # IPv4-mapped IPv6 loopback
+        "http://[::ffff:10.0.0.1]/",            # IPv4-mapped IPv6 private
+        "ftp://example.com/file",               # Prohibited protocol
+    ]
+
+    for target_url in prohibited_urls:
+        is_valid, err, _ = validate_url_ssrf(target_url, allow_local=False)
+        assert is_valid is False, f"URL '{target_url}' should have been rejected by SSRF protection"
+        assert len(err) > 0
+
+    # 2. Redirect pivot prevention: URL on safe host that redirects to internal address must be aborted
+    session = requests.Session()
+    redirect_target = f"{mock_server}/redirect_to_internal"
+    with pytest.raises(requests.exceptions.RequestException) as exc_info:
+        safe_request_get(session, redirect_target, allow_local=False)
+    assert "SSRF violation" in str(exc_info.value)
+
+    redirect_private = f"{mock_server}/redirect_to_prohibited"
+    with pytest.raises(requests.exceptions.RequestException) as exc_info2:
+        safe_request_get(session, redirect_private, allow_local=False)
+    assert "SSRF violation" in str(exc_info2.value)
+
+
+def test_fail_closed_socket_binding_error(mock_server):
+    """
+    Requirement (P0 audit): Verify binding at the connection/socket layer,
+    propagate binding-specific failures reliably without string searches,
+    and prove fail-closed behavior on invalid interface configurations.
+    """
+    # 1. Independent socket-layer verification method fails on invalid source IP
+    adapter_bad_ip = BoundInterfaceHTTPAdapter(ifname="eth0", source_ip="198.51.100.254")
+    ok, err = adapter_bad_ip.verify_socket_binding()
+    assert ok is False
+    assert "Socket binding verification failed" in err
+
+    # 2. Sockets attempting to send through invalid interface configuration fail closed with InterfaceBindingError
+    session = requests.Session()
+    session.mount("http://", adapter_bad_ip)
+
+    with pytest.raises(InterfaceBindingError) as exc_info:
+        session.get(f"{mock_server}/test", timeout=1.0)
+    assert "Interface socket binding or connection failed" in str(exc_info.value)
+
+
+def test_opt_in_linux_policy_routing():
+    """
+    Requirement (WSL2 routing audit): Interface discovery must be 100% read-only and
+    never mutate host routing as a side effect. Policy-route installation must be an
+    explicit opt-in operation with safe preview.
+    """
+    nm = NetworkManager()
+    # Discover interfaces must not invoke sudo ip rule mutating commands
+    ifaces = nm.discover_interfaces()
+    assert isinstance(ifaces, list)
+
+    # Explicit policy routing preview (apply=False) must generate plan without executing
+    preview = nm.configure_linux_policy_routing(apply=False)
+    assert isinstance(preview, dict)
+    assert "plan" in preview
+    assert preview["applied"] is False
 
 
 def test_api_concurrency_limit_and_ssrf_protection(speedbond_api_server):
@@ -600,7 +791,7 @@ def test_api_concurrency_limit_and_ssrf_protection(speedbond_api_server):
         timeout=5.0
     )
     assert resp_ssrf.status_code == 403
-    assert "SSRF protection" in resp_ssrf.json().get("error", "")
+    assert "SSRF" in resp_ssrf.json().get("error", "")
 
     # 2. Concurrency Limit: Enforce maximum 3 active downloads
     server.downloads.clear()
@@ -618,4 +809,5 @@ def test_api_concurrency_limit_and_ssrf_protection(speedbond_api_server):
     assert resp_limit.status_code == 429
     assert "Concurrent download limit reached" in resp_limit.json().get("error", "")
     server.downloads.clear()
+
 

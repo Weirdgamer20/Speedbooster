@@ -7,13 +7,16 @@ handles proxy=None gracefully, and avoids NameErrors during interface refresh.
 import os
 import json
 import uuid
+import socket
+import ipaddress
 import threading
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from urllib.parse import urlparse
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple, List
 from network_manager import NetworkManager
 from downloader import BondedDownloadTask
 from proxy import MultiWANProxyServer
+from security_utils import validate_url_ssrf, is_prohibited_ip
 
 class SpeedBondServer:
     def __init__(self, net_mgr: NetworkManager, proxy: Optional[MultiWANProxyServer] = None, host: str = "127.0.0.1", port: int = 5000):
@@ -80,32 +83,15 @@ class SpeedBondServer:
                         self._send_json({"error": "URL is required"}, status=400)
                         return
 
-                    # 1. Validate URL scheme and targets
-                    parsed_url = urlparse(url)
-                    if parsed_url.scheme not in ("http", "https"):
-                        self._send_json({"error": "Only http and https schemes are permitted"}, status=400)
-                        return
-                    hostname = (parsed_url.hostname or "").lower()
-                    if not hostname:
-                        self._send_json({"error": "Invalid URL hostname"}, status=400)
-                        return
-
-                    # SSRF protection: block loopback and private/internal targets unless ALLOW_LOCAL_TEST_DOWNLOADS=1
+                    # 1. Comprehensive SSRF protection: resolves all A/AAAA records and inspects IP targets
                     allow_local = os.environ.get("ALLOW_LOCAL_TEST_DOWNLOADS") == "1"
-                    if not allow_local:
-                        is_blocked = (
-                            hostname in ("localhost", "127.0.0.1", "::1", "0.0.0.0")
-                            or hostname.startswith("127.")
-                            or hostname.startswith("169.254.")
-                            or hostname.startswith("10.")
-                            or hostname.startswith("192.168.")
-                            or (hostname.startswith("172.") and any(hostname.startswith(f"172.{b}.") for b in range(16, 32)))
-                        )
-                        if is_blocked:
-                            self._send_json({"error": "SSRF protection: private and loopback destination addresses are forbidden"}, status=403)
-                            return
+                    is_valid, ssrf_err, _ = validate_url_ssrf(url, allow_local=allow_local)
+                    if not is_valid:
+                        self._send_json({"error": ssrf_err}, status=403)
+                        return
 
                     # 2. Prevent path traversal in target filename using canonical path resolution
+                    parsed_url = urlparse(url)
                     raw_filename = (data.get("filename") or os.path.basename(parsed_url.path) or "downloaded_file.bin").strip()
                     candidate_path = os.path.join(sb_self.download_dir, raw_filename)
                     resolved_dest = os.path.realpath(candidate_path)
@@ -117,7 +103,7 @@ class SpeedBondServer:
                         return
 
                     task_id = str(uuid.uuid4())[:8]
-                    task = BondedDownloadTask(task_id, url, resolved_dest, sb_self.net_mgr)
+                    task = BondedDownloadTask(task_id, url, resolved_dest, sb_self.net_mgr, allow_local=allow_local)
                     sb_self.downloads[task_id] = task
                     success = task.start()
                     self._send_json({"success": success, "task": task.get_progress()})
