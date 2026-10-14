@@ -11,6 +11,7 @@ import json
 import time
 import socket
 import ssl
+import ipaddress
 import subprocess
 import threading
 from typing import List, Dict, Optional, Tuple
@@ -266,22 +267,42 @@ class BoundInterfaceHTTPAdapter(HTTPAdapter):
 
     def verify_socket_binding(self) -> Tuple[bool, str]:
         """
-        Independently verifies at the socket layer that an outbound socket can be created
-        and bound to the configured interface and source address.
+        Verifies local socket binding setup. This does not prove that an outbound route works.
         """
         s = None
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            family = socket.AF_INET
+            source_addr = None
+            if self.source_ip:
+                source_obj = ipaddress.ip_address(self.source_ip)
+                family = socket.AF_INET6 if source_obj.version == 6 else socket.AF_INET
+                source_addr = (
+                    (self.source_ip, 0, 0, 0)
+                    if family == socket.AF_INET6
+                    else (self.source_ip, 0)
+                )
+
+            s = socket.socket(family, socket.SOCK_STREAM)
             s.settimeout(2.0)
             if sys.platform.startswith("linux") and hasattr(socket, "SO_BINDTODEVICE"):
                 if self.ifname and self.ifname not in ["lo", "127.0.0.1", "loopback"]:
-                    s.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_BINDTODEVICE", 25), self.ifname.encode() + b"\0")
+                    s.setsockopt(
+                        socket.SOL_SOCKET,
+                        getattr(socket, "SO_BINDTODEVICE", 25),
+                        self.ifname.encode() + b"\\0",
+                    )
             elif sys.platform == "win32" and self.if_index > 0:
                 import struct
-                s.setsockopt(socket.IPPROTO_IP, getattr(socket, "IP_UNICAST_IF", 31), struct.pack("!I", self.if_index))
-            if self.source_ip:
-                s.bind((self.source_ip, 0))
-            return True, "Socket binding verified"
+                if family == socket.AF_INET6:
+                    option = getattr(socket, "IPV6_UNICAST_IF", None)
+                    if option is None:
+                        return False, "IPv6 interface binding is unsupported by this Python/Windows socket runtime."
+                    s.setsockopt(socket.IPPROTO_IPV6, option, struct.pack("!I", self.if_index))
+                else:
+                    s.setsockopt(socket.IPPROTO_IP, getattr(socket, "IP_UNICAST_IF", 31), struct.pack("!I", self.if_index))
+            if source_addr:
+                s.bind(source_addr)
+            return True, "Local socket binding setup verified"
         except Exception as e:
             return False, f"Socket binding verification failed on '{self.ifname}': {e}"
         finally:
