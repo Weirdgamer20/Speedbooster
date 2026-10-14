@@ -289,7 +289,7 @@ class BoundInterfaceHTTPAdapter(HTTPAdapter):
                     s.setsockopt(
                         socket.SOL_SOCKET,
                         getattr(socket, "SO_BINDTODEVICE", 25),
-                        self.ifname.encode() + b"\\0",
+                        self.ifname.encode() + b"\0",
                     )
             elif sys.platform == "win32" and self.if_index > 0:
                 import struct
@@ -855,15 +855,16 @@ class NetworkManager:
                 f"Destination rejected by SSRF/DNS validation ({host}:{port}): {validation_error}"
             )
 
-        source_family = socket.AF_INET
+        source_family = None
         if source_ip:
             source_family = socket.AF_INET6 if ipaddress.ip_address(source_ip).version == 6 else socket.AF_INET
 
-        # All returned DNS addresses have already been checked. Choose a validated address
-        # compatible with the configured source-address family and connect to that literal.
+        # All returned DNS addresses have already been checked. When a source address exists,
+        # select only a compatible destination; otherwise support IPv4 and IPv6-only targets.
         compatible_ips = [
             ip for ip in resolved_ips
-            if (socket.AF_INET6 if ipaddress.ip_address(ip).version == 6 else socket.AF_INET) == source_family
+            if source_family is None
+            or (socket.AF_INET6 if ipaddress.ip_address(ip).version == 6 else socket.AF_INET) == source_family
         ]
         if not compatible_ips:
             raise InterfaceBindingError(
@@ -881,7 +882,7 @@ class NetworkManager:
 
         try:
             if sys.platform.startswith("linux") and hasattr(socket, "SO_BINDTODEVICE") and ifname not in ["lo", "127.0.0.1", "loopback"]:
-                sock.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_BINDTODEVICE", 25), ifname.encode() + b"\\0")
+                sock.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_BINDTODEVICE", 25), ifname.encode() + b"\0")
             elif sys.platform == "win32" and if_index > 0:
                 import struct
                 if family == socket.AF_INET6:
