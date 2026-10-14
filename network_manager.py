@@ -900,9 +900,16 @@ class NetworkManager:
                 source_addr = (source_ip, 0, 0, 0) if family == socket.AF_INET6 else (source_ip, 0)
                 sock.bind(source_addr)
 
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1048576)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1048576)
+            # Performance tuning is optional; binding and destination validation above are mandatory.
+            for level, option, value in (
+                (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),
+                (socket.SOL_SOCKET, socket.SO_RCVBUF, 1048576),
+                (socket.SOL_SOCKET, socket.SO_SNDBUF, 1048576),
+            ):
+                try:
+                    sock.setsockopt(level, option, value)
+                except OSError as option_error:
+                    logger.debug("Optional socket tuning option %s failed: %s", option, option_error)
             sock.settimeout(timeout)
             target_addr = (target_ip, port, 0, 0) if family == socket.AF_INET6 else (target_ip, port)
             sock.connect(target_addr)
