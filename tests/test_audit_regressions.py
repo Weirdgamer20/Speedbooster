@@ -101,3 +101,10 @@ def test_literal_ip_with_invalid_port_is_rejected():
     valid, error, _ = security_utils.validate_url_ssrf("http://8.8.8.8:99999/")
     assert valid is False
     assert "Invalid URL port" in error
+
+
+
+def test_zero_url_port_is_rejected_instead_of_defaulting_to_port_80():
+    valid, error, _ = security_utils.validate_url_ssrf("http://8.8.8.8:0/")
+    assert valid is False
+    assert "Invalid URL port: 0" in error
