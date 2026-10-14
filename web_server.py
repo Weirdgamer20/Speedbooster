@@ -122,7 +122,7 @@ class SpeedBondServer:
                         or os.path.basename(normalized_filename) != normalized_filename
                         or "\x00" in normalized_filename
                     ):
-                        self._send_json({"error": "Filename must be a non-empty basename without path separators"}, status=400)
+                        self._send_json({"error": "Filename path traversal or invalid basename rejected"}, status=403)
                         return
                     candidate_path = os.path.join(sb_self.download_dir, raw_filename)
                     resolved_dest = os.path.realpath(candidate_path)
