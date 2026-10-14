@@ -78,6 +78,9 @@ class SpeedBondServer:
                         return
                     body = self.rfile.read(content_len).decode("utf-8") if content_len > 0 else "{}"
                     data = json.loads(body) if body else {}
+                    if not isinstance(data, dict):
+                        self._send_json({"error": "JSON request body must be an object"}, status=400)
+                        return
                 except Exception as e:
                     self._send_json({"error": f"Invalid JSON payload: {e}"}, status=400)
                     return
@@ -89,7 +92,11 @@ class SpeedBondServer:
                         self._send_json({"error": "Concurrent download limit reached (maximum 3 active downloads)"}, status=429)
                         return
 
-                    url = (data.get("url") or "").strip()
+                    raw_url = data.get("url")
+                    if not isinstance(raw_url, str):
+                        self._send_json({"error": "URL must be a string"}, status=400)
+                        return
+                    url = raw_url.strip()
                     if not url:
                         self._send_json({"error": "URL is required"}, status=400)
                         return
@@ -103,7 +110,20 @@ class SpeedBondServer:
 
                     # 2. Prevent path traversal in target filename using canonical path resolution
                     parsed_url = urlparse(url)
-                    raw_filename = (data.get("filename") or os.path.basename(parsed_url.path) or "downloaded_file.bin").strip()
+                    supplied_filename = data.get("filename")
+                    if supplied_filename is not None and not isinstance(supplied_filename, str):
+                        self._send_json({"error": "Filename must be a string"}, status=400)
+                        return
+                    raw_filename = (supplied_filename or os.path.basename(parsed_url.path) or "downloaded_file.bin").strip()
+                    normalized_filename = raw_filename.replace("\\", "/")
+                    if (
+                        not normalized_filename
+                        or normalized_filename in (".", "..")
+                        or os.path.basename(normalized_filename) != normalized_filename
+                        or "\\x00" in normalized_filename
+                    ):
+                        self._send_json({"error": "Filename must be a non-empty basename without path separators"}, status=400)
+                        return
                     candidate_path = os.path.join(sb_self.download_dir, raw_filename)
                     resolved_dest = os.path.realpath(candidate_path)
                     resolved_dir = os.path.realpath(sb_self.download_dir)
@@ -121,6 +141,9 @@ class SpeedBondServer:
 
                 elif parsed.path == "/api/stop":
                     task_id = data.get("task_id")
+                    if not isinstance(task_id, str):
+                        self._send_json({"error": "task_id must be a string"}, status=400)
+                        return
                     if task_id in sb_self.downloads:
                         sb_self.downloads[task_id].cancel()
                         self._send_json({"success": True})
