@@ -174,7 +174,8 @@ class MultiWANProxyServer:
                 try:
                     parsed = urlsplit(target)
                     host = parsed.hostname
-                    port = parsed.port or 80
+                    explicit_port = parsed.port
+                    port = explicit_port if explicit_port is not None else 80
                     if port < 1 or port > 65535:
                         raise ValueError("Destination port must be between 1 and 65535")
                 except ValueError:
