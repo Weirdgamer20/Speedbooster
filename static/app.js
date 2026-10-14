@@ -142,7 +142,7 @@ function renderDownloads(downloads) {
 
     let chunksInfo = "";
     if (dl.iface_chunks && Object.keys(dl.iface_chunks).length > 0) {
-      chunksInfo = "Slices: " + Object.entries(dl.iface_chunks).map(([iface, cnt]) => `${iface}: ${cnt}`).join(" | ");
+      chunksInfo = "Slices: " + Object.entries(dl.iface_chunks).map(([iface, cnt]) => `${escapeHtml(iface)}: ${escapeHtml(cnt)}`).join(" | ");
     }
 
     html += `

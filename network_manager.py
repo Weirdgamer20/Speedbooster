@@ -11,9 +11,10 @@ import json
 import time
 import socket
 import ssl
+import ipaddress
 import subprocess
 import threading
-from typing import List, Dict, Optional, Tuple
+from typing import Any, List, Dict, Optional, Tuple
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.connection import create_connection
@@ -266,22 +267,42 @@ class BoundInterfaceHTTPAdapter(HTTPAdapter):
 
     def verify_socket_binding(self) -> Tuple[bool, str]:
         """
-        Independently verifies at the socket layer that an outbound socket can be created
-        and bound to the configured interface and source address.
+        Verifies local socket binding setup. This does not prove that an outbound route works.
         """
         s = None
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            family = socket.AF_INET
+            source_addr = None
+            if self.source_ip:
+                source_obj = ipaddress.ip_address(self.source_ip)
+                family = socket.AF_INET6 if source_obj.version == 6 else socket.AF_INET
+                source_addr = (
+                    (self.source_ip, 0, 0, 0)
+                    if family == socket.AF_INET6
+                    else (self.source_ip, 0)
+                )
+
+            s = socket.socket(family, socket.SOCK_STREAM)
             s.settimeout(2.0)
             if sys.platform.startswith("linux") and hasattr(socket, "SO_BINDTODEVICE"):
                 if self.ifname and self.ifname not in ["lo", "127.0.0.1", "loopback"]:
-                    s.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_BINDTODEVICE", 25), self.ifname.encode() + b"\0")
+                    s.setsockopt(
+                        socket.SOL_SOCKET,
+                        getattr(socket, "SO_BINDTODEVICE", 25),
+                        self.ifname.encode() + b"\0",
+                    )
             elif sys.platform == "win32" and self.if_index > 0:
                 import struct
-                s.setsockopt(socket.IPPROTO_IP, getattr(socket, "IP_UNICAST_IF", 31), struct.pack("!I", self.if_index))
-            if self.source_ip:
-                s.bind((self.source_ip, 0))
-            return True, "Socket binding verified"
+                if family == socket.AF_INET6:
+                    option = getattr(socket, "IPV6_UNICAST_IF", None)
+                    if option is None:
+                        return False, "IPv6 interface binding is unsupported by this Python/Windows socket runtime."
+                    s.setsockopt(socket.IPPROTO_IPV6, option, struct.pack("!I", self.if_index))
+                else:
+                    s.setsockopt(socket.IPPROTO_IP, getattr(socket, "IP_UNICAST_IF", 31), struct.pack("!I", self.if_index))
+            if source_addr:
+                s.bind(source_addr)
+            return True, "Local socket binding setup verified"
         except Exception as e:
             return False, f"Socket binding verification failed on '{self.ifname}': {e}"
         finally:
@@ -293,68 +314,91 @@ class BoundInterfaceHTTPAdapter(HTTPAdapter):
 
     def verify_outbound_binding(self, test_url: Optional[str] = None) -> Tuple[bool, str]:
         """
-        Tests an actual outbound connection through this production HTTP adapter and verifies
-        that the connection succeeds, mandatory interface options are applied, and the socket's bound
-        local endpoint matches self.source_ip.
+        Verifies a live outbound request and validates telemetry captured from that request.
+        Socket creation/bind checks alone are not evidence of outbound routing.
         """
+        if not test_url:
+            return False, "Outbound verification requires an explicit live test URL; socket setup alone is insufficient."
+
         ok, err = self.verify_socket_binding()
         if not ok:
             return False, err
 
-        if test_url:
-            try:
-                s = requests.Session()
-                s.trust_env = False
-                s.mount("http://", self)
-                s.mount("https://", self)
-                resp = s.get(test_url, timeout=4.0)
-                if resp.status_code >= 400:
-                    return False, f"Outbound probe returned error HTTP {resp.status_code}"
+        session = requests.Session()
+        session.trust_env = False
+        session.mount("http://", self)
+        session.mount("https://", self)
+        resp = None
+        try:
+            # Stream so the underlying connection remains inspectable until telemetry is checked.
+            resp = session.get(test_url, timeout=4.0, allow_redirects=False, stream=True)
+            if not (200 <= resp.status_code < 300):
+                return False, f"Outbound probe returned HTTP {resp.status_code}; expected a 2xx response."
 
-                # Verify actual socket telemetry from production connection
-                telem = self.last_telemetry or {}
-                actual_local_ip = telem.get("local_ip")
-                actual_peer_ip = telem.get("peer_ip")
-                applied_options = telem.get("options", [])
+            telem = self.last_telemetry or {}
+            actual_local_ip = telem.get("local_ip")
+            actual_peer_ip = telem.get("peer_ip")
+            applied_options = telem.get("options") or []
 
-                if self.source_ip and actual_local_ip and actual_local_ip != self.source_ip:
-                    return False, (
-                        f"Outbound connection local IP mismatch on '{self.ifname}': "
-                        f"expected {self.source_ip}, got actual {actual_local_ip}"
-                    )
+            if not actual_local_ip or not actual_peer_ip:
+                return False, "Outbound probe completed without current-request local/peer socket telemetry."
 
-                return True, (
-                    f"Verified outbound connection through adapter '{self.ifname}' "
-                    f"(local: {actual_local_ip or self.source_ip}, peer: {actual_peer_ip}, options: {applied_options})"
+            if self.source_ip and actual_local_ip != self.source_ip:
+                return False, (
+                    f"Outbound connection local IP mismatch on '{self.ifname}': "
+                    f"expected {self.source_ip}, got actual {actual_local_ip}"
                 )
-            except Exception as e:
-                return False, f"Outbound connection failed through adapter '{self.ifname}': {e}"
 
-        return True, f"Local socket options and address binding verified for '{self.ifname}' (outbound probe unperformed)"
+            if self.source_ip and "source_address" not in applied_options:
+                return False, "Outbound telemetry does not prove that the required source address was bound."
+
+            if not self.source_ip and not applied_options:
+                return False, "No mandatory interface-binding mechanism is configured or proven for this adapter."
+
+            if sys.platform.startswith("linux") and self.ifname not in ["lo", "127.0.0.1", "loopback"]:
+                bind_opt = getattr(socket, "SO_BINDTODEVICE", 25)
+                if bind_opt not in applied_options:
+                    return False, "Outbound telemetry does not prove SO_BINDTODEVICE was applied."
+
+            if sys.platform == "win32" and self.if_index > 0:
+                bind_opt = getattr(socket, "IP_UNICAST_IF", 31)
+                if bind_opt not in applied_options:
+                    return False, "Outbound telemetry does not prove IP_UNICAST_IF was applied."
+
+            return True, (
+                f"Verified outbound live request through adapter '{self.ifname}' "
+                f"(local: {actual_local_ip}, peer: {actual_peer_ip}, options: {applied_options})"
+            )
+        except Exception as e:
+            return False, f"Outbound connection failed through adapter '{self.ifname}': {e}"
+        finally:
+            if resp is not None:
+                resp.close()
+            # The adapter may be shared with a live downloader session; do not let
+            # closing this temporary probe session close the caller's production adapter.
+            session.adapters.clear()
+            session.close()
 
     def send(self, request, **kwargs):
-        """Wraps send to ensure socket-level interface or source-address binding failures fail closed and captures connection telemetry."""
+        """Fail closed on binding errors and refresh telemetry from the connection used by this request."""
+        self.last_telemetry = None
         try:
             resp = super().send(request, **kwargs)
-            # Inspect underlying pool or connection for telemetry if not already populated
-            if not self.last_telemetry:
-                conn = getattr(resp.raw, "_connection", None)
-                if conn:
-                    if hasattr(conn, "last_telemetry") and conn.last_telemetry:
-                        self.last_telemetry = conn.last_telemetry
-                    elif hasattr(conn, "_actual_local_ip"):
-                        self.last_telemetry = {
-                            "local_ip": getattr(conn, "_actual_local_ip", None),
-                            "local_port": getattr(conn, "_actual_local_port", None),
-                            "peer_ip": getattr(conn, "_actual_peer_ip", None),
-                            "peer_port": getattr(conn, "_actual_peer_port", None),
-                            "options": getattr(conn, "_interface_options_applied", []),
-                            "interface_options_applied": getattr(conn, "_interface_options_applied", []),
-                        }
+            conn = getattr(getattr(resp, "raw", None), "_connection", None)
+            if conn is not None:
+                options = list(getattr(conn, "_interface_options_applied", []) or [])
+                self.last_telemetry = {
+                    "local_ip": getattr(conn, "_actual_local_ip", None),
+                    "local_port": getattr(conn, "_actual_local_port", None),
+                    "peer_ip": getattr(conn, "_actual_peer_ip", None),
+                    "peer_port": getattr(conn, "_actual_peer_port", None),
+                    "options": options,
+                    "interface_options_applied": options,
+                }
             return resp
         except InterfaceBindingError:
             raise
-        except (requests.exceptions.ConnectionError, requests.exceptions.ConnectTimeout, OSError, socket.error) as e:
+        except (requests.exceptions.RequestException, OSError, socket.error) as e:
             raise InterfaceBindingError(
                 f"Interface socket binding or connection failed on '{self.ifname}' (IP: {self.source_ip}): {e}"
             ) from e
@@ -484,11 +528,23 @@ class NetworkManager:
         Interface discovery never invokes this method automatically.
         """
         if not sys.platform.startswith("linux"):
-            return {"supported": False, "reason": "Not running on Linux/WSL2"}
+            return {
+                "supported": False,
+                "reason": "Not running on Linux/WSL2",
+                "applied": False,
+                "rollback": False,
+                "plan": [],
+            }
 
         active = [i for i in self.interfaces.values() if i.is_active and i.ip and i.gateway]
         if len(active) < 2:
-            return {"supported": False, "reason": "Requires at least 2 active interfaces with IP and gateway"}
+            return {
+                "supported": False,
+                "reason": "Requires at least 2 active interfaces with IP and gateway",
+                "applied": False,
+                "rollback": False,
+                "plan": [],
+            }
 
         try:
             rule_out = subprocess.check_output(["ip", "rule", "show"], text=True, stderr=subprocess.DEVNULL, timeout=3)
@@ -724,55 +780,90 @@ class NetworkManager:
 
     def _test_interface_egress(self, ifname: str, source_ip: Optional[str] = None) -> Tuple[Optional[str], float]:
         """
-        Tests whether an interface can route to the internet.
-        Windows: binds by source IP address (the only supported method).
-        Linux: additionally applies SO_BINDTODEVICE for strict interface pinning.
+        Tests internet egress using a validated, pinned public IPv4 destination.
+        Rejects DNS answers containing prohibited ranges and validates the response as a public IP.
         Returns (public_ip, latency_ms), or (None, 0.0) on failure.
         """
         t0 = time.time()
+        sock = None
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            if source_ip and ipaddress.ip_address(source_ip).version != 4:
+                logger.warning("IPv6 source address is not supported by this IPv4 egress probe: %s", source_ip)
+                return None, 0.0
 
-            # Linux: SO_BINDTODEVICE pins the socket to a physical NIC
+            valid, validation_error, resolved_ips = validate_url_ssrf("http://api.ipify.org:80/", allow_local=False)
+            if not valid:
+                logger.warning("Egress probe destination validation failed: %s", validation_error)
+                return None, 0.0
+            # Socket is AF_INET, so pin a validated IPv4 result rather than allowing connect()
+            # to perform a second DNS lookup or choose an IPv6 address.
+            ipv4_targets = [ip for ip in resolved_ips if ipaddress.ip_address(ip).version == 4]
+            if not ipv4_targets:
+                logger.warning("Egress probe hostname returned no validated IPv4 address")
+                return None, 0.0
+            target_ip = ipv4_targets[0]
+
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             if sys.platform.startswith("linux") and hasattr(socket, "SO_BINDTODEVICE"):
                 if ifname and ifname not in ["lo", "127.0.0.1", "loopback"]:
-                    try:
-                        s.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_BINDTODEVICE", 25), ifname.encode() + b"\0")
-                    except Exception as be:
-                        s.close()
-                        logger.error("SO_BINDTODEVICE failed for '%s': %s (failing closed)", ifname, be)
-                        return None, 0.0
+                    sock.setsockopt(
+                        socket.SOL_SOCKET,
+                        getattr(socket, "SO_BINDTODEVICE", 25),
+                        ifname.encode() + b"\0",
+                    )
 
-            # Windows & Linux: bind source IP so packets egress via the correct adapter
             if source_ip:
-                try:
-                    s.bind((source_ip, 0))
-                except Exception as be:
-                    s.close()
-                    logger.error("Source IP bind failed for '%s' (ip=%s): %s", ifname, source_ip, be)
-                    return None, 0.0
+                sock.bind((source_ip, 0))
 
-            s.settimeout(8.0)
-            s.connect(("api.ipify.org", 80))
+            sock.settimeout(8.0)
+            sock.connect((target_ip, 80))
             latency = (time.time() - t0) * 1000
-            s.sendall(b"GET / HTTP/1.1\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n")
-            buf = b""
-            while True:
-                c = s.recv(512)
-                if not c:
+            sock.sendall(b"GET / HTTP/1.1\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n")
+
+            buf = bytearray()
+            while len(buf) <= 8192:
+                chunk = sock.recv(min(512, 8193 - len(buf)))
+                if not chunk:
                     break
-                buf += c
-            s.close()
-            parts = buf.split(b"\r\n\r\n")
-            if len(parts) > 1:
-                pub_ip = parts[-1].decode("ascii", errors="ignore").strip()
-                if pub_ip:
-                    logger.info("Egress verified: iface='%s' source='%s' public_ip='%s' latency=%.1fms",
-                                ifname, source_ip, pub_ip, latency)
-                    return pub_ip, latency
+                buf.extend(chunk)
+            if len(buf) > 8192:
+                logger.warning("Egress probe response exceeded the 8 KiB limit")
+                return None, 0.0
+
+            header_body = bytes(buf).split(b"\r\n\r\n", 1)
+            if len(header_body) != 2:
+                logger.warning("Egress probe response did not contain a valid HTTP header/body boundary")
+                return None, 0.0
+            status_line = header_body[0].split(b"\r\n", 1)[0]
+            if not status_line.startswith(b"HTTP/") or b" 200 " not in status_line:
+                logger.warning("Egress probe returned unexpected HTTP status: %r", status_line)
+                return None, 0.0
+
+            body = header_body[1].decode("ascii", errors="strict").strip()
+            try:
+                public_ip = ipaddress.ip_address(body)
+            except ValueError:
+                logger.warning("Egress probe returned a non-IP body: %r", body[:100])
+                return None, 0.0
+            if not public_ip.is_global or is_prohibited_ip(public_ip):
+                logger.warning("Egress probe returned a non-public address: %s", public_ip)
+                return None, 0.0
+
+            result_ip = str(public_ip)
+            logger.info(
+                "Egress verified: iface='%s' source='%s' public_ip='%s' pinned_peer='%s' latency=%.1fms",
+                ifname, source_ip, result_ip, target_ip, latency
+            )
+            return result_ip, latency
         except Exception as e:
             logger.info("Egress test failed for '%s' (ip=%s): %s", ifname, source_ip, e)
-        return None, 0.0
+            return None, 0.0
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
 
     def create_requests_session(self, ifname: str) -> requests.Session:
         """Creates a requests.Session whose sockets are bound strictly to `ifname`."""
@@ -793,60 +884,116 @@ class NetworkManager:
         return session
 
     def create_bound_socket(self, ifname: str, host: str, port: int, timeout: float = 15.0, use_ssl: bool = False):
-        """Creates a TCP socket bound strictly to the specified physical interface."""
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        """
+        Creates a source/interface-bound socket to a validated public IP literal.
+        DNS is validated before connect and the socket connects to the selected IP,
+        preventing a second resolver lookup from changing the destination.
+        Private, loopback, link-local, and reserved targets are rejected by default.
+        """
+        if not isinstance(port, int) or not 1 <= port <= 65535:
+            raise InterfaceBindingError(f"Invalid destination port: {port!r}")
+
         ifstat = self.interfaces.get(ifname)
         source_ip = ifstat.ip if ifstat else None
         gateway = ifstat.gateway if ifstat else None
         if_index = ifstat.if_index if ifstat else 0
 
+        clean_host = str(host).strip("[]").lower()
+        url_host = f"[{clean_host}]" if ":" in clean_host else clean_host
+        scheme = "https" if use_ssl else "http"
+        target_url = f"{scheme}://{url_host}:{port}/"
+        is_valid, validation_error, resolved_ips = validate_url_ssrf(target_url, allow_local=False)
+        if not is_valid or not resolved_ips:
+            raise InterfaceBindingError(
+                f"Destination rejected by SSRF/DNS validation ({host}:{port}): {validation_error}"
+            )
+
+        linux_device_binding_required = (
+            sys.platform.startswith("linux")
+            and ifname not in ["lo", "127.0.0.1", "loopback"]
+        )
+        if linux_device_binding_required and not hasattr(socket, "SO_BINDTODEVICE"):
+            raise InterfaceBindingError("SO_BINDTODEVICE is unavailable; refusing an unbound raw proxy connection.")
+        if not source_ip and not (
+            linux_device_binding_required
+            or (sys.platform == "win32" and if_index > 0)
+        ):
+            raise InterfaceBindingError(
+                f"No mandatory interface or source-address binding is available for adapter '{ifname}'."
+            )
+
+        source_family = None
+        if source_ip:
+            source_family = socket.AF_INET6 if ipaddress.ip_address(source_ip).version == 6 else socket.AF_INET
+
+        # All returned DNS addresses have already been checked. When a source address exists,
+        # select only a compatible destination; otherwise support IPv4 and IPv6-only targets.
+        compatible_ips = [
+            ip for ip in resolved_ips
+            if source_family is None
+            or (socket.AF_INET6 if ipaddress.ip_address(ip).version == 6 else socket.AF_INET) == source_family
+        ]
+        if not compatible_ips:
+            raise InterfaceBindingError(
+                f"No validated destination address for '{host}' matches the source/interface address family."
+            )
+        target_ip = compatible_ips[0]
+        target_obj = ipaddress.ip_address(target_ip)
+        family = socket.AF_INET6 if target_obj.version == 6 else socket.AF_INET
+        sock = socket.socket(family, socket.SOCK_STREAM)
+
         logger.info(
-            "Binding raw socket: target=%s:%d, iface='%s', source_ip='%s', gateway='%s', if_index=%d",
-            host, port, ifname, source_ip, gateway, if_index
+            "Binding raw socket: target=%s:%d (validated IP=%s), iface='%s', source_ip='%s', gateway='%s', if_index=%d",
+            host, port, target_ip, ifname, source_ip, gateway, if_index
         )
 
-        if sys.platform.startswith("linux") and hasattr(socket, "SO_BINDTODEVICE") and ifname not in ["lo", "127.0.0.1", "loopback"]:
-            try:
+        try:
+            if sys.platform.startswith("linux") and hasattr(socket, "SO_BINDTODEVICE") and ifname not in ["lo", "127.0.0.1", "loopback"]:
                 sock.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_BINDTODEVICE", 25), ifname.encode() + b"\0")
-            except Exception as e:
-                sock.close()
-                raise InterfaceBindingError(f"Failed to set SO_BINDTODEVICE for interface '{ifname}': {e}") from e
-        elif sys.platform == "win32" and if_index > 0:
-            import struct
-            IP_UNICAST_IF = getattr(socket, "IP_UNICAST_IF", 31)
-            try:
-                sock.setsockopt(socket.IPPROTO_IP, IP_UNICAST_IF, struct.pack("!I", if_index))
-            except Exception as e:
-                sock.close()
-                raise InterfaceBindingError(f"Failed to set IP_UNICAST_IF for interface '{ifname}' (index {if_index}): {e}") from e
+            elif sys.platform == "win32" and if_index > 0:
+                import struct
+                if family == socket.AF_INET6:
+                    option = getattr(socket, "IPV6_UNICAST_IF", None)
+                    if option is None:
+                        raise InterfaceBindingError("IPv6 interface binding is unsupported by this Windows socket runtime.")
+                    sock.setsockopt(socket.IPPROTO_IPV6, option, struct.pack("!I", if_index))
+                else:
+                    sock.setsockopt(socket.IPPROTO_IP, getattr(socket, "IP_UNICAST_IF", 31), struct.pack("!I", if_index))
 
-        if source_ip:
-            try:
-                sock.bind((source_ip, 0))
-            except Exception as e:
-                sock.close()
-                raise InterfaceBindingError(f"Failed to bind source IP '{source_ip}' for interface '{ifname}': {e}") from e
+            if source_ip:
+                if ipaddress.ip_address(source_ip).version != target_obj.version:
+                    raise InterfaceBindingError(
+                        f"Source IP {source_ip} and destination {target_ip} use different address families."
+                    )
+                source_addr = (source_ip, 0, 0, 0) if family == socket.AF_INET6 else (source_ip, 0)
+                sock.bind(source_addr)
 
-        try:
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1048576)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1048576)
-        except Exception:
-            pass
-
-        sock.settimeout(timeout)
-        try:
-            sock.connect((host, port))
-            logger.info("Connected to %s:%d via iface='%s' (local=%s)", host, port, ifname, sock.getsockname())
+            # Performance tuning is optional; binding and destination validation above are mandatory.
+            for level, option, value in (
+                (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),
+                (socket.SOL_SOCKET, socket.SO_RCVBUF, 1048576),
+                (socket.SOL_SOCKET, socket.SO_SNDBUF, 1048576),
+            ):
+                try:
+                    sock.setsockopt(level, option, value)
+                except OSError as option_error:
+                    logger.debug("Optional socket tuning option %s failed: %s", option, option_error)
+            sock.settimeout(timeout)
+            target_addr = (target_ip, port, 0, 0) if family == socket.AF_INET6 else (target_ip, port)
+            sock.connect(target_addr)
+            logger.info(
+                "Connected to %s:%d via iface='%s' (validated peer=%s, local=%s)",
+                host, port, ifname, sock.getpeername(), sock.getsockname()
+            )
+            return sock
         except Exception as e:
             sock.close()
-            logger.error("Connection failed to %s:%d via iface='%s': %s", host, port, ifname, e)
-            raise
-
-        if use_ssl:
-            wrapped = self.ssl_context.wrap_socket(sock, server_hostname=host)
-            return wrapped
-        return sock
+            if isinstance(e, InterfaceBindingError):
+                raise
+            logger.error("Connection failed to validated target %s:%d via iface='%s': %s", target_ip, port, ifname, e)
+            raise InterfaceBindingError(
+                f"Connection to validated destination {target_ip}:{port} failed via '{ifname}': {e}"
+            ) from e
 
     def start_monitoring(self, interval_sec: float = 0.5):
         """Starts real-time stats calculation."""

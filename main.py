@@ -6,6 +6,7 @@ and the integrated dashboard & proxy services.
 
 import sys
 import os
+import ipaddress
 import time
 import argparse
 import subprocess
@@ -62,10 +63,28 @@ def main():
     parser.add_argument("--download", type=str, help="Download a file using verified multi-interface parallel range chunks")
     parser.add_argument("--output", type=str, help="Output destination for download")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Host address for services (default: 127.0.0.1)")
+    parser.add_argument("--allow-remote-bind", action="store_true", help="Explicitly allow the unauthenticated dashboard and proxy to listen beyond loopback")
     parser.add_argument("--proxy-port", type=int, default=8080, help="Port for the Multi-WAN proxy (default: 8080)")
     parser.add_argument("--web-port", "--port", type=int, default=5000, help="Port for the Dashboard UI (default: 5000)")
     parser.add_argument("--no-proxy", action="store_true", help="Disable the local proxy server")
     args = parser.parse_args()
+
+    if not args.diagnose and not args.download:
+        try:
+            bind_ip = ipaddress.ip_address(args.host)
+            if bind_ip.version != 4:
+                parser.error("The current dashboard/proxy listeners use IPv4 sockets; use an IPv4 bind address.")
+            loopback_bind = bind_ip.is_loopback
+        except ValueError:
+            loopback_bind = args.host.lower() == "localhost"
+        if not loopback_bind and not args.allow_remote_bind:
+            parser.error(
+                "--host must be localhost/loopback by default. Binding the unauthenticated dashboard/proxy "
+                "to a LAN or public interface requires --allow-remote-bind."
+            )
+        if not loopback_bind and args.allow_remote_bind:
+            print("[SECURITY WARNING] Remote bind enabled: the dashboard and proxy have no authentication. "
+                  "Use only on a trusted network with firewall restrictions.")
 
     net_mgr = NetworkManager()
 

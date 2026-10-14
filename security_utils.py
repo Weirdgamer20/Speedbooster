@@ -7,7 +7,7 @@ secondary DNS resolution TOCTOU races, while preserving correct TLS SNI and cert
 import socket
 import ipaddress
 import urllib.parse
-from typing import Tuple, List, Optional, Dict
+from typing import Tuple, List, Optional, Dict, Union
 import requests
 import urllib3
 from urllib3.connection import HTTPConnection, HTTPSConnection
@@ -58,6 +58,14 @@ def validate_url_ssrf(url: str, allow_local: bool = False) -> Tuple[bool, str, L
     if not hostname:
         return False, "Missing hostname in URL", []
 
+    try:
+        explicit_port = parsed.port
+        port = explicit_port if explicit_port is not None else (443 if parsed.scheme == "https" else 80)
+        if not 1 <= port <= 65535:
+            return False, f"Invalid URL port: {port}", []
+    except ValueError as e:
+        return False, f"Invalid URL port: {e}", []
+
     clean_host = hostname.strip("[]").lower()
 
     # If allow_local is set (for internal testing suite), permit localhost and 127.0.0.1
@@ -104,7 +112,6 @@ def validate_url_ssrf(url: str, allow_local: bool = False) -> Tuple[bool, str, L
         except (ValueError, OverflowError):
             pass
 
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
 
     try:
         addr_info = socket.getaddrinfo(clean_host, port, family=socket.AF_UNSPEC, proto=socket.IPPROTO_TCP)
@@ -152,7 +159,21 @@ def resolve_and_validate_host(host: str, port: int = 80, allow_local: bool = Fal
     if allow_local and clean_host in ("127.0.0.1", "localhost", "::1"):
         return "127.0.0.1"
 
-    url = f"http://{host}:{port}/"
+    # Handle IP literals before URL construction; bare IPv6 literals must be bracketed
+    # inside URLs, but socket connection APIs expect the unbracketed address.
+    try:
+        literal_ip = ipaddress.ip_address(clean_host)
+    except ValueError:
+        literal_ip = None
+    if literal_ip is not None:
+        if is_prohibited_ip(literal_ip) and not (allow_local and literal_ip.is_loopback):
+            raise requests.exceptions.RequestException(
+                f"SSRF / DNS rebinding security rejection for '{host}': prohibited IP address"
+            )
+        return str(literal_ip)
+
+    url_host = f"[{clean_host}]" if ":" in clean_host else clean_host
+    url = f"http://{url_host}:{port}/"
     is_valid, err_msg, resolved_ips = validate_url_ssrf(url, allow_local=allow_local)
     if not is_valid or not resolved_ips:
         raise requests.exceptions.RequestException(f"SSRF / DNS rebinding security rejection for '{host}': {err_msg}")
@@ -357,7 +378,9 @@ def safe_request_get(
     # Enforce safe proxy policy: disable unverified environment proxy inheritance
     session.trust_env = trust_env
 
-    # If explicit proxies are supplied in kwargs or session, validate proxy destination against SSRF
+    # Requests' proxy manager creates a different connection path and cannot guarantee
+    # that the validated destination IP is the actual peer. Validate configured proxy URLs
+    # for a clear diagnostic, then reject proxy routing in this strict SSRF-safe helper.
     proxies = kwargs.get("proxies") or session.proxies or {}
     for scheme, proxy_url in proxies.items():
         if proxy_url:
@@ -366,6 +389,10 @@ def safe_request_get(
                 raise requests.exceptions.RequestException(
                     f"SSRF violation: Prohibited proxy configuration for {scheme} ({proxy_url}): {p_err}"
                 )
+    if any(proxies.values()):
+        raise requests.exceptions.RequestException(
+            "Proxy routing is unsupported in SSRF-safe mode because it bypasses direct destination-IP pinning."
+        )
 
     current_url = url
     for hop in range(max_redirects + 1):

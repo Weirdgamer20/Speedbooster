@@ -4,6 +4,20 @@ All notable changes to the SpeedBond project are documented in this file.
 
 ---
 
+## [Follow-up audit repair — 2026-10-14] (branch: `fix/latest-commit-audit`)
+
+### Blockers fixed and repo-wide hardening
+* Fixed missing `Union`, `Any`, and `random` imports that prevented module import or randomized benchmark execution.
+* Declared SciPy as a dependency; removed approximate inference fallback; preserved full-precision p-values for Holm correction; treated zero-variance paired/Welch samples as inconclusive.
+* Made randomized trial order reproducible with a recorded seed and used paired block-level comparisons for `AB-A` and `AB-B`.
+* Hardened URL port validation (including port zero), IPv6 literal resolution, raw proxy destination validation, and public egress probing. Strict SSRF-safe Requests now rejects explicit proxy routing because it cannot prove the proxy's final destination IP. Raw sockets connect to a validated IP instead of triggering a second DNS lookup; private/reserved destinations are rejected by default.
+* Required a live URL and current-request socket telemetry for outbound-binding verification; made socket preflight address-family aware and avoided closing a shared adapter after a temporary probe.
+* Added explicit opt-in for non-loopback service binding, rejected cross-origin browser POSTs, validated API payload types and filenames, escaped interface labels in dashboard HTML, and corrected initial proxy round-robin selection.
+* Added regression tests and GitHub Actions checks for Python 3.11 and 3.12. At validated SHA `3ea8b1b6b9db48dbaa1bb83b958f7034c7e683db`, both CI jobs passed with **50 passed, 1 skipped**; `compileall` and Ruff undefined-name checks also passed.
+* **Remaining limitation:** Hosted CI cannot certify Windows/WSL2 physical interface isolation. `test_physical_adapter_hardware_traffic_isolation` remains skipped, and physical multi-WAN aggregation remains unverified until tested with genuinely independent uplinks.
+
+---
+
 ## [v2.1.4] — 2026-10-14
 
 ### Security, Connection Architecture & Statistical Rigor (Audit Repair Release)
