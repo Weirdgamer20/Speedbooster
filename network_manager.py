@@ -352,6 +352,9 @@ class BoundInterfaceHTTPAdapter(HTTPAdapter):
             if self.source_ip and "source_address" not in applied_options:
                 return False, "Outbound telemetry does not prove that the required source address was bound."
 
+            if not self.source_ip and not applied_options:
+                return False, "No mandatory interface-binding mechanism is configured or proven for this adapter."
+
             if sys.platform.startswith("linux") and self.ifname not in ["lo", "127.0.0.1", "loopback"]:
                 bind_opt = getattr(socket, "SO_BINDTODEVICE", 25)
                 if bind_opt not in applied_options:
