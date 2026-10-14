@@ -88,3 +88,16 @@ def test_malformed_url_port_is_rejected_as_validation_result():
     assert valid is False
     assert "Invalid URL port" in error
     assert ips == []
+
+
+
+def test_raw_proxy_socket_rejects_private_destination_before_connect():
+    manager = network_manager.NetworkManager()
+    with pytest.raises(network_manager.InterfaceBindingError, match="SSRF/DNS validation"):
+        manager.create_bound_socket("lo", "127.0.0.1", 80)
+
+
+def test_literal_ip_with_invalid_port_is_rejected():
+    valid, error, _ = security_utils.validate_url_ssrf("http://8.8.8.8:99999/")
+    assert valid is False
+    assert "Invalid URL port" in error
