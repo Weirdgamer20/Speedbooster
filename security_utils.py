@@ -58,6 +58,11 @@ def validate_url_ssrf(url: str, allow_local: bool = False) -> Tuple[bool, str, L
     if not hostname:
         return False, "Missing hostname in URL", []
 
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError as e:
+        return False, f"Invalid URL port: {e}", []
+
     clean_host = hostname.strip("[]").lower()
 
     # If allow_local is set (for internal testing suite), permit localhost and 127.0.0.1
@@ -104,10 +109,6 @@ def validate_url_ssrf(url: str, allow_local: bool = False) -> Tuple[bool, str, L
         except (ValueError, OverflowError):
             pass
 
-    try:
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    except ValueError as e:
-        return False, f"Invalid URL port: {e}", []
 
     try:
         addr_info = socket.getaddrinfo(clean_host, port, family=socket.AF_UNSPEC, proto=socket.IPPROTO_TCP)
