@@ -75,6 +75,32 @@ except ImportError as exc:
 _HAS_SCIPY = True
 
 
+def _randomized_trial_order(configs: List[dict], rng=None) -> List[dict]:
+    """Return a shuffled copy of the configurations without mutating the caller's list."""
+    ordered = list(configs)
+    (rng or random).shuffle(ordered)
+    return ordered
+
+
+def paired_t_test(samples_a: List[float], samples_b: List[float]) -> Tuple[float, float, float, bool]:
+    """
+    One-sided paired t-test for H1: mean(samples_a - samples_b) > 0.
+    Inputs must be aligned by randomized trial block. Degenerate differences are inconclusive.
+    """
+    if len(samples_a) < 2 or len(samples_a) != len(samples_b):
+        return 0.0, 1.0, 0.0, False
+
+    differences = [float(a) - float(b) for a, b in zip(samples_a, samples_b)]
+    mean_diff = sum(differences) / len(differences)
+    variance = sum((x - mean_diff) ** 2 for x in differences) / (len(differences) - 1)
+    if variance == 0.0:
+        return 0.0, 1.0, 0.0, False
+
+    res = scipy.stats.ttest_1samp(differences, popmean=0.0, alternative="greater")
+    t_stat, p_val, df = float(res.statistic), float(res.pvalue), float(res.df)
+    return t_stat, p_val, df, (p_val < 0.05 and t_stat > 0)
+
+
 def get_target_nic_names(net_mgr: NetworkManager, ifnames: List[str]) -> Set[str]:
     """Resolves logical interface names to their exact OS-level NIC counter identifiers."""
     names = set()
@@ -111,8 +137,6 @@ def compute_statistics(samples: List[float]) -> dict:
     stderr = std_dev / math.sqrt(n)
     df = n - 1
 
-    if _HAS_SCIPY:
-        t_crit = float(scipy.stats.t.ppf(0.975, df=df))
     t_crit = float(scipy.stats.t.ppf(0.975, df=df))
 
     margin = t_crit * stderr
@@ -393,9 +417,12 @@ def main():
     parser.add_argument("--url", type=str, default="https://www.python.org/ftp/python/3.12.0/python-3.12.0-amd64.exe", help="URL of test file supporting byte ranges")
     parser.add_argument("--dest-dir", type=str, default="./bench_output", help="Output directory for test downloads")
     parser.add_argument("--trials", type=int, default=1, help="Number of repetitions per configuration to average")
+    parser.add_argument("--seed", type=int, default=None, help="Optional RNG seed for reproducible randomized trial order")
     parser.add_argument("--expected-sha256", type=str, default=None, help="Trusted SHA-256 digest to verify integrity")
     parser.add_argument("--allow-shared-uplink", action="store_true", help="Permit benchmarking even if adapters share gateway/public IP")
     args = parser.parse_args()
+    if args.trials < 1:
+        parser.error("--trials must be at least 1")
 
     expected_hash = args.expected_sha256
     if not expected_hash and "python-3.12.0-amd64.exe" in args.url:
@@ -450,15 +477,17 @@ def main():
     cfg_ab = {"id": "AB", "name": f"Combined A+B ({iface_a} + {iface_b})", "dest": dest_ab, "ifaces": [iface_a, iface_b], "runs": runs_ab}
     all_cfgs = [cfg_a, cfg_b, cfg_ab]
 
+    seed = args.seed if args.seed is not None else random.SystemRandom().randrange(0, 2**32)
+    rng = random.Random(seed)
     print(f"\n[BENCHMARK SUITE] Executing {trials_count} randomized/interleaved trial block(s)...")
+    print(f"  Randomization seed: {seed}")
     for block_idx in range(1, trials_count + 1):
         if trials_count > 1:
             print(f"\n==================================================")
             print(f"  --- [Trial Block {block_idx}/{trials_count} (Randomized Order)] ---")
             print(f"==================================================")
         # Randomize trial order within each repeated block to eliminate temporal drift bias
-        block_order = list(all_cfgs)
-        random.shuffle(block_order)
+        block_order = _randomized_trial_order(all_cfgs, rng=rng)
         order_names = " -> ".join(c["id"] for c in block_order)
         print(f"  Block {block_idx} order: [{order_names}]")
 
@@ -607,8 +636,10 @@ def main():
     samples_a = [r["decimal_mb_s"] for r in res_a.get("runs", []) if r["status"] == "completed"]
     samples_b = [r["decimal_mb_s"] for r in res_b.get("runs", []) if r["status"] == "completed"]
 
-    t_stat_a, p_val_a, df_a, sig_a = welch_t_test(samples_combined, samples_a)
-    t_stat_b, p_val_b, df_b, sig_b = welch_t_test(samples_combined, samples_b)
+    # Each configuration has one result per block. Use paired block-level differences
+    # to account for temporal/network conditions shared by each A/B/AB block.
+    t_stat_a, p_val_a, df_a, sig_a = paired_t_test(samples_combined, samples_a)
+    t_stat_b, p_val_b, df_b, sig_b = paired_t_test(samples_combined, samples_b)
 
     # Holm-Bonferroni step-down correction for m=2 comparisons against both single-adapter baselines
     comp_list = sorted([
@@ -626,7 +657,7 @@ def main():
     is_statistically_significant = holm_results["Adapter A"]["sig"] and holm_results["Adapter B"]["sig"]
 
     if trials_count > 1:
-        print("\n--- Statistical Significance (Holm-Bonferroni Corrected Welch t-tests) ---")
+        print("\n--- Statistical Significance (Holm-Corrected Paired t-tests) ---")
         print(f"  Comparison vs {comp_list[0][0]}: t={comp_list[0][1]:.3f}, df={comp_list[0][3]:.1f}, raw p={comp_list[0][2]:.4f}, adj p={p_adj_first:.4f} {'(Significant)' if holm_results[comp_list[0][0]]['sig'] else '(Not Significant)'}")
         print(f"  Comparison vs {comp_list[1][0]}: t={comp_list[1][1]:.3f}, df={comp_list[1][3]:.1f}, raw p={comp_list[1][2]:.4f}, adj p={p_adj_second:.4f} {'(Significant)' if holm_results[comp_list[1][0]]['sig'] else '(Not Significant)'}")
 
@@ -647,7 +678,7 @@ def main():
         print("          N=1 cannot certify statistical significance or rule out network variance. Run with --trials 10+ for rigorous certification.")
     elif not is_statistically_significant:
         print(f"[VERDICT] AGGREGATION INCONCLUSIVE: Empirical gain observed (+{((combined_speed/best_single_speed)-1)*100:.1f}%), but sample variability overlaps.")
-        print(f"          Welch t-test with Holm-Bonferroni correction failed to reach significance (p_adj >= 0.05).")
+        print(f"          Paired t-test with Holm correction failed to reach significance (p_adj >= 0.05).")
     else:
         st_ab = res_ab.get("stats", {})
         print(f"[VERDICT] PHYSICAL DUAL-WAN AGGREGATION VERIFIED: Statistically significant throughput gain certified across repeated trials.")
