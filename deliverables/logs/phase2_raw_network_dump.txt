@@ -1,0 +1,88 @@
+=== GET-NETADAPTER ===
+
+Name                               InterfaceDescription                       ifIndex Status       MacAddress        Li
+                                                                                                                     nk
+                                                                                                                     Sp
+                                                                                                                     ee
+                                                                                                                     d 
+----                               --------------------                       ------- ------       ----------        --
+Bluetooth Network Connection       Bluetooth Device (Personal Area Network)        20 Disconnected A0-B3-39-F2-AC-05 3 
+vEthernet (FSE HostVnic)           Hyper-V Virtual Ethernet Container Adapter      77 Up           00-15-5D-37-C2-5D 10
+vEthernet (WSL (Hyper-V firewall)) Hyper-V Virtual Ethernet Adapter                55 Up           00-15-5D-56-8C-49 10
+WiFi 2                             802.11n USB Wireless LAN Card                    8 Up           00-17-7C-9C-44-B0 72
+WiFi                               Intel(R) Wi-Fi 6E AX211 160MHz                   6 Up           A0-B3-39-F2-AC-01 78
+Ethernet                           Realtek Gaming GbE Family Controller             3 Disconnected 2C-58-B9-EB-10-4C 0 
+
+
+
+=== NETSH WLAN SHOW INTERFACES ===
+
+There are 2 interfaces on the system: 
+
+    Name                   : WiFi
+    Description            : Intel(R) Wi-Fi 6E AX211 160MHz
+    GUID                   : 336dc657-7048-4250-bb63-ad6f4d369fb4
+    Physical address       : a0:b3:39:f2:ac:01
+    Interface type         : Primary
+    State                  : connected
+    SSID                   : Airtel_7644095225
+    AP BSSID               : f4:4d:5c:e9:96:bb
+    Band                   : 5 GHz
+    Channel                : 149
+    Connected Akm-cipher   : [ akm = 00-0f-ac:02, cipher =  00-0f-ac:04 ]
+    Network type           : Infrastructure
+    Radio type             : 802.11ac
+    Authentication         : WPA2-Personal
+    Cipher                 : CCMP
+    Connection mode        : Auto Connect
+    Receive rate (Mbps)    : 650
+    Transmit rate (Mbps)   : 780
+    Signal                 : 85% 
+    Rssi                   : -56
+    Profile                : Airtel_7644095225 
+    QoS MSCS Configured         : 0
+    QoS Map Configured          : 0
+    QoS Map Allowed by Policy   : 0
+
+    Name                   : WiFi 2
+    Description            : 802.11n USB Wireless LAN Card
+    GUID                   : 3dc4dd6d-5f95-4ec4-90ca-d4770846d70c
+    Physical address       : 00:17:7c:9c:44:b0
+    Interface type         : Primary
+    State                  : connected
+    SSID                   : Airtel_7644095225
+    AP BSSID               : f4:4d:5c:e9:96:ba
+    Band                   : 2.4 GHz
+    Channel                : 1
+    Network type           : Infrastructure
+    Radio type             : 802.11n
+    Authentication         : WPA2-Personal
+    Cipher                 : CCMP
+    Connection mode        : Profile
+    Receive rate (Mbps)    : 600
+    Transmit rate (Mbps)   : 72
+    Signal                 : 100% 
+    Profile                : Airtel_7644095225 
+    QoS MSCS Configured         : 0
+    QoS Map Configured          : 0
+    QoS Map Allowed by Policy   : 0
+
+
+=== GET-NETIPCONFIGURATION ===
+
+InterfaceAlias InterfaceDescription           IPv4Address   IPv4DefaultGateway                                         
+-------------- --------------------           -----------   ------------------                                         
+WiFi           Intel(R) Wi-Fi 6E AX211 160MHz {192.168.1.6} {MSFT_NetRoute (InstanceID = ":8:8:8:9:55@55;C?8;@B8;8;5...
+WiFi 2         802.11n USB Wireless LAN Card  {192.168.1.9} {MSFT_NetRoute (InstanceID = ":8:8:8:9:55B55;C?8;@B8;8;5...
+
+
+
+=== GET-NETROUTE DEFAULT ROUTES ===
+
+InterfaceAlias InterfaceIndex DestinationPrefix NextHop     RouteMetric
+-------------- -------------- ----------------- -------     -----------
+WiFi                        6 0.0.0.0/0         192.168.1.1           0
+WiFi 2                      8 0.0.0.0/0         192.168.1.1           0
+
+
+

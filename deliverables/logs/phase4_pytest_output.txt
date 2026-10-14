@@ -1,0 +1,24 @@
+============================= test session starts ==============================
+platform linux -- Python 3.14.4, pytest-9.0.2, pluggy-1.6.0 -- /usr/bin/python3
+cachedir: .pytest_cache
+rootdir: /home/tg/speedbond
+plugins: typeguard-4.4.4
+collecting ... collected 15 items
+
+tests/test_speedbond.py::test_compilation PASSED                         [  6%]
+tests/test_speedbond.py::test_range_success_with_trusted_checksum PASSED [ 13%]
+tests/test_speedbond.py::test_range_checksum_mismatch PASSED             [ 20%]
+tests/test_speedbond.py::test_ignored_range_safe_fallback PASSED         [ 26%]
+tests/test_speedbond.py::test_wrong_content_range_rejected PASSED        [ 33%]
+tests/test_speedbond.py::test_oversized_body_rejected PASSED             [ 40%]
+tests/test_speedbond.py::test_truncated_body_rejected PASSED             [ 46%]
+tests/test_speedbond.py::test_incorrect_total_size_rejected PASSED       [ 53%]
+tests/test_speedbond.py::test_etag_mutation_detected PASSED              [ 60%]
+tests/test_speedbond.py::test_cancellation_and_worker_termination PASSED [ 66%]
+tests/test_speedbond.py::test_binding_failure_reported PASSED            [ 73%]
+tests/test_speedbond.py::test_refresh_api_real_http_post PASSED          [ 80%]
+tests/test_speedbond.py::test_path_traversal_actual_http_endpoint PASSED [ 86%]
+tests/test_speedbond.py::test_bound_interface_adapter_socket_options PASSED [ 93%]
+tests/test_speedbond.py::test_physical_adapter_hardware_traffic_isolation PASSED [100%]
+
+============================= 15 passed in 40.35s ==============================

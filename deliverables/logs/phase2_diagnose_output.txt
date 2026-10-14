@@ -1,0 +1,39 @@
+======================================================================
+  ⚡ SpeedBond Diagnostics & Network Egress Audit
+======================================================================
+
+[1] Windows Hardware Layer Discovery (via PowerShell Get-NetAdapter):
+    - MAC: a0:b3:39:f2:ac:05 | Name: Bluetooth Network Connection | Status: Disconnected | Desc: Bluetooth Device (Personal Area Network)
+    - MAC: 00:15:5d:37:c2:5d | Name: vEthernet (FSE HostVnic) | Status: Up | Desc: Hyper-V Virtual Ethernet Container Adapter
+    - MAC: 00:15:5d:56:8c:49 | Name: vEthernet (WSL (Hyper-V firewall)) | Status: Up | Desc: Hyper-V Virtual Ethernet Adapter
+    - MAC: 00:17:7c:9c:44:b0 | Name: WiFi 2 | Status: Up | Desc: 802.11n USB Wireless LAN Card
+    - MAC: a0:b3:39:f2:ac:01 | Name: WiFi | Status: Up | Desc: Intel(R) Wi-Fi 6E AX211 160MHz
+    - MAC: 2c:58:b9:eb:10:4c | Name: Ethernet | Status: Disconnected | Desc: Realtek Gaming GbE Family Controller
+
+[2] Active Linux Network Interfaces (WSL2 Mirrored Mode):
+    - eth1:
+        Label:      WiFi 2 (802.11n USB Wireless LAN Card)
+        Hardware:   802.11n USB Wireless LAN Card
+        MAC:        00:17:7c:9c:44:b0
+        Local IP:   192.168.1.9
+        Gateway:    192.168.1.1
+        Public IP:  223.235.*.*
+        Ping:       91.3 ms
+    - eth2:
+        Label:      WiFi (Intel(R) Wi-Fi 6E AX211 160MHz)
+        Hardware:   Intel(R) Wi-Fi 6E AX211 160MHz
+        MAC:        a0:b3:39:f2:ac:01
+        Local IP:   192.168.1.6
+        Gateway:    192.168.1.1
+        Public IP:  223.235.*.*
+        Ping:       101.2 ms
+
+[3] Explicit Path Validation Layer (Dual-Path Egress Proof):
+    Active Path Count:          2
+    Independent Egress Proven:  False
+    Status:                     WARNING: Independent egress cannot be proven. All interfaces share the same gateway and public IP. Ensure one adapter connects to Home Wi-Fi and the other to Mobile Hotspot.
+
+    [NOTICE] For true multi-provider aggregation:
+             Connect Interface 1 to Home Wi-Fi/Fiber (e.g. Airtel)
+             Connect Interface 2 to Mobile Hotspot/USB Dongle (e.g. Jio)
+======================================================================

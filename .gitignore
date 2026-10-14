@@ -1,0 +1,27 @@
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Pytest and testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Temporary and download files
+*.speedbond_part
+*.bin
+benchmarks/
+bench_output/
+*.log
+*.pid
+
+# IDE and OS files
+.vscode/
+.idea/
+*.swp
+*~
+Thumbs.db
+
+# Archives
+*.zip

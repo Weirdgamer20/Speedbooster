@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>⚡ Speedometer HUD</title>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@700;800&family=JetBrains+Mono:wght@700;800&display=swap" rel="stylesheet">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #090d16;
+      color: #fff;
+      font-family: 'Plus Jakarta Sans', sans-serif;
+      padding: 14px 18px;
+      height: 100vh;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      border: 1.5px solid rgba(168, 85, 247, 0.4);
+      border-radius: 14px;
+    }
+    .hud-tag {
+      font-size: 10px;
+      font-weight: 800;
+      color: #a855f7;
+      letter-spacing: 1.5px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .live-dot {
+      width: 7px; height: 7px; background: #34d399; border-radius: 50%;
+      box-shadow: 0 0 8px #34d399;
+    }
+    .speed-row {
+      display: flex;
+      align-items: baseline;
+      gap: 6px;
+      margin: 2px 0;
+    }
+    .speed-val {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 38px;
+      font-weight: 800;
+      color: #ffffff;
+      text-shadow: 0 0 16px rgba(56, 189, 248, 0.5);
+    }
+    .speed-unit {
+      font-size: 15px;
+      font-weight: 700;
+      color: #94a3b8;
+    }
+    .adapters-sub {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      color: #64748b;
+    }
+  </style>
+</head>
+<body>
+  <div class="hud-tag">
+    <span>⚡ SPEEDBOND HUD</span>
+    <span class="live-dot"></span>
+  </div>
+  <div class="speed-row">
+    <span id="hud-speed" class="speed-val">0.00</span>
+    <span class="speed-unit">MB/s</span>
+  </div>
+  <div id="hud-breakdown" class="adapters-sub">WiFi: 0.0 MB/s | Dongle: 0.0 MB/s</div>
+
+  <script>
+    async function update() {
+      try {
+        const res = await fetch('/api/stats');
+        const data = await res.json();
+        const total = (data.total_speed_mbytes_sec || 0).toFixed(2);
+        document.getElementById('hud-speed').textContent = total;
+        if (data.interfaces && data.interfaces.length >= 2) {
+          const s1 = data.interfaces[0].speed_mbytes_sec.toFixed(1);
+          const s2 = data.interfaces[1].speed_mbytes_sec.toFixed(1);
+          document.getElementById('hud-breakdown').textContent = `WiFi: ${s1} MB/s | Dongle: ${s2} MB/s`;
+        }
+      } catch (e) {}
+    }
+    setInterval(update, 500);
+    update();
+  </script>
+</body>
+</html>

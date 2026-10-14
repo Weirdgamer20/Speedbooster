@@ -1,0 +1,26 @@
+{
+  "benchmark_timestamp": "2026-10-14T09:14:23Z",
+  "payload_bytes": 16777216,
+  "payload_decimal_mb": 16.777216,
+  "payload_binary_mib": 16.0,
+  "expected_sha256": "87f330b33d4b83dc3cda72c2db953033be55035f0bd8cddbdcc45348cb4cb87b",
+  "single_stream_trial": {
+    "elapsed_sec": 0.366,
+    "throughput_decimal_mb_s": 45.84,
+    "throughput_binary_mib_s": 43.72,
+    "throughput_mbps": 366.72,
+    "status": "completed",
+    "calculated_sha256": "87f330b33d4b83dc3cda72c2db953033be55035f0bd8cddbdcc45348cb4cb87b",
+    "integrity_match": true
+  },
+  "parallel_chunked_trial": {
+    "elapsed_sec": 0.315,
+    "throughput_decimal_mb_s": 53.26,
+    "throughput_binary_mib_s": 50.79,
+    "throughput_mbps": 426.09,
+    "status": "completed",
+    "calculated_sha256": "87f330b33d4b83dc3cda72c2db953033be55035f0bd8cddbdcc45348cb4cb87b",
+    "checksum_verified": true,
+    "integrity_match": true
+  }
+}
