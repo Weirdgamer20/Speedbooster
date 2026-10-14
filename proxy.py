@@ -22,7 +22,7 @@ class MultiWANProxyServer:
         self.server_sock = None
         self._running = False
         self._thread = None
-        self._iface_idx = 0
+        self._iface_idx = -1
         self._lock = threading.Lock()
         self._concurrency_limiter = threading.Semaphore(max_connections)
 
