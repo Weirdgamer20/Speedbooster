@@ -11,12 +11,15 @@ import time
 import math
 import random
 import hashlib
+import logging
 import threading
 import queue
 import requests
 from urllib.parse import urlparse
 from typing import Dict, List, Optional, Callable, Tuple
 from network_manager import NetworkManager, InterfaceStats
+
+logger = logging.getLogger("speedbond.downloader")
 
 CHUNK_SIZE = 2 * 1024 * 1024  # 2MB chunks
 MAX_CHUNK_RETRIES = 3
@@ -67,6 +70,7 @@ class BondedDownloadTask:
         self._chunk_queue = queue.Queue()
         self._file_lock = threading.Lock()
         self._state_lock = threading.RLock()
+        self._finalize_lock = threading.Lock()
         self._cancel_event = threading.Event()
         self._threads: List[threading.Thread] = []
         self._callbacks: List[Callable] = []
@@ -108,16 +112,21 @@ class BondedDownloadTask:
                 resp = session.get(self.url, headers=headers, timeout=(6.0, 10.0), stream=True)
 
                 if resp.status_code == 206:
-                    # Valid partial content response
-                    content_range = resp.headers.get("Content-Range", "")
-                    m = re.search(r"bytes\s+0-1/(\d+)", content_range)
+                    # Valid partial content response: require full-match Content-Range and verify length
+                    content_range = resp.headers.get("Content-Range", "").strip()
+                    m = re.fullmatch(r"bytes\s+0-1/(\d+)", content_range)
                     if m:
-                        self.total_size = int(m.group(1))
-                        self.supports_ranges = True
-                        self.etag = resp.headers.get("ETag")
-                        self.last_modified = resp.headers.get("Last-Modified")
-                        resp.close()
-                        return True
+                        total = int(m.group(1))
+                        probe_body = resp.raw.read(16)
+                        if len(probe_body) == 2 and total >= 2:
+                            self.total_size = total
+                            self.supports_ranges = True
+                            self.etag = resp.headers.get("ETag")
+                            self.last_modified = resp.headers.get("Last-Modified")
+                            resp.close()
+                            return True
+                        else:
+                            logger.warning("Probe received invalid slice body length (%d) or total (%d)", len(probe_body), total)
                 elif resp.status_code == 200:
                     # Server ignored Range header and returned full body
                     cl = resp.headers.get("Content-Length")
@@ -183,7 +192,16 @@ class BondedDownloadTask:
 
     def _worker_loop(self, ifname: str):
         ifstat = self.net_mgr.interfaces.get(ifname)
-        session = self.net_mgr.create_requests_session(ifname)
+        try:
+            session = self.net_mgr.create_requests_session(ifname)
+        except Exception as e:
+            logger.error("Failed to construct worker session on %s: %s", ifname, e)
+            with self._state_lock:
+                self.error_message = f"Worker initialization failed on {ifname}: {e}"
+                self.status = "failed"
+                self._cancel_event.set()
+            self._notify()
+            return
 
         while not self._cancel_event.is_set():
             try:
@@ -349,11 +367,13 @@ class BondedDownloadTask:
             return bool(self.chunks) and all(c.status == "completed" for c in self.chunks)
 
     def _check_completion(self):
-        with self._state_lock:
-            if self.status != "running":
-                return
-            if not self._is_all_chunks_done():
-                return
+        with self._finalize_lock:
+            with self._state_lock:
+                if self.status != "running":
+                    return
+                if not self._is_all_chunks_done():
+                    return
+                self.status = "finalizing"
             self._finalize_file()
 
     def _finalize_file(self):
@@ -364,25 +384,33 @@ class BondedDownloadTask:
                 expected_offset = 0
                 for c in self.chunks:
                     if c.status != "completed":
-                        self.status = "failed"
-                        self.error_message = f"Cannot finalize: chunk {c.chunk_id} incomplete"
+                        with self._state_lock:
+                            self.status = "failed"
+                            self.error_message = f"Cannot finalize: chunk {c.chunk_id} incomplete"
+                        self._notify()
                         return
                     if c.start_byte != expected_offset:
-                        self.status = "failed"
-                        self.error_message = f"Gap detected: expected offset {expected_offset}, found {c.start_byte}"
+                        with self._state_lock:
+                            self.status = "failed"
+                            self.error_message = f"Gap detected: expected offset {expected_offset}, found {c.start_byte}"
+                        self._notify()
                         return
                     expected_offset = c.end_byte + 1
 
                 if expected_offset != self.total_size:
-                    self.status = "failed"
-                    self.error_message = f"Size mismatch: expected {self.total_size}, final offset {expected_offset}"
+                    with self._state_lock:
+                        self.status = "failed"
+                        self.error_message = f"Size mismatch: expected {self.total_size}, final offset {expected_offset}"
+                    self._notify()
                     return
 
             # 2. Verify file size on disk
             actual_size = os.path.getsize(self.temp_path)
             if self.total_size > 0 and actual_size != self.total_size:
-                self.status = "failed"
-                self.error_message = f"Disk size mismatch: expected {self.total_size}, got {actual_size}"
+                with self._state_lock:
+                    self.status = "failed"
+                    self.error_message = f"Disk size mismatch: expected {self.total_size}, got {actual_size}"
+                self._notify()
                 return
 
             # 3. Compute SHA-256 and distinguish calculated vs trusted verification
@@ -398,14 +426,15 @@ class BondedDownloadTask:
                     self.checksum_verified = True
                 else:
                     self.checksum_verified = False
-                    self.status = "failed"
-                    self.error_message = (
-                        f"Checksum verification failed: expected {self.expected_sha256}, "
-                        f"got {self.calculated_sha256}"
-                    )
+                    with self._state_lock:
+                        self.status = "failed"
+                        self.error_message = (
+                            f"Checksum verification failed: expected {self.expected_sha256}, "
+                            f"got {self.calculated_sha256}"
+                        )
+                    self._notify()
                     return
             else:
-                # Documented that checksum was calculated only, not verified against a trusted external digest
                 self.checksum_verified = None
 
             # 4. Atomic rename
@@ -413,16 +442,19 @@ class BondedDownloadTask:
                 os.remove(self.dest_path)
             os.rename(self.temp_path, self.dest_path)
 
-            self.status = "completed"
-            self.end_time = time.time()
+            with self._state_lock:
+                self.status = "completed"
+                self.end_time = time.time()
             self._notify()
 
         except Exception as e:
-            self.status = "failed"
-            self.error_message = f"Finalization failed: {e}"
+            with self._state_lock:
+                self.status = "failed"
+                self.error_message = f"Finalization failed: {e}"
+            self._notify()
 
     def cancel(self):
-        """Cancels task, aborts worker threads, and marks state cancelled."""
+        """Cancels task, aborts worker threads, and safely manages temporary file cleanup."""
         with self._state_lock:
             if self.status in ["completed", "failed", "cancelled"]:
                 return
@@ -430,17 +462,22 @@ class BondedDownloadTask:
             self.end_time = time.time()
         self._cancel_event.set()
 
-        # Join worker threads before deleting temporary files
+        # Join worker threads before attempting partial file removal
         for t in self._threads:
             if t.is_alive():
                 t.join(timeout=2.0)
 
-        # Clean up partial temp file
-        try:
-            if os.path.exists(self.temp_path):
-                os.remove(self.temp_path)
-        except Exception:
-            pass
+        # Retain temporary file if any writer thread has not cleanly stopped to prevent race conditions
+        if not any(t.is_alive() for t in self._threads):
+            try:
+                if os.path.exists(self.temp_path):
+                    os.remove(self.temp_path)
+            except Exception:
+                pass
+        else:
+            logger.warning("Retaining temporary file %s because some worker threads are still terminating", self.temp_path)
+
+        self._notify()
 
     def get_progress(self) -> dict:
         """Returns truthful progress derived strictly from verified completed chunk byte ranges."""

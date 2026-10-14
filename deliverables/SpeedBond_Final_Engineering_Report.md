@@ -2,7 +2,7 @@
 
 **System:** SpeedBond (Multi-Interface Network Aggregator)  
 **Author:** Senior Windows Networking & Software Quality Engineering  
-**Version:** 2.1.0  
+**Version:** 2.1.1  
 **Date:** 14 October 2026  
 **Overall Readiness Verdict:** **SOFTWARE READY — NETWORK AGGREGATION UNVERIFIED**  
 
@@ -12,23 +12,24 @@
 
 SpeedBond is an application-level multi-WAN network aggregation system designed for Windows PCs equipped with two Wi-Fi adapters: an onboard **Intel Wi-Fi 6E AX211** adapter and an external **802.11n USB Wi-Fi Dongle**.
 
-This engineering audit investigated verified defects in socket binding, RFC 9110 HTTP Range semantics, chunk integrity, worker lifecycle, and API security. All code-level defects have been repaired, and the automated test suite has been expanded to 15 deterministic tests, achieving a **100% pass rate (15/15 passed in 40.35s)**.
+This engineering audit investigated verified defects in socket binding, RFC 9110 HTTP Range semantics, chunk integrity, worker lifecycle, proxy concurrency, path validation, and API security. All code-level defects identified in the source code audit have been repaired, and the automated test suite has been expanded to 19 deterministic tests, achieving a **100% pass rate (19/19 passed in 64.89s)**.
 
 At the physical network layer, Windows diagnostic discovery established that while both adapters are operational, both currently connect to the **same home Wi-Fi access point (`Airtel_7644095225`)**, share the **same default gateway (`192.168.1.1`)**, and egress through the **same public IP (`223.235.*.*`)**. Therefore, independent dual-WAN aggregation is physically blocked until Adapter B is reconnected to a separate mobile hotspot, and physical multi-WAN aggregation remains **UNVERIFIED**.
 
 ---
 
-## 2. Original Defects and Technical Impact
+## 2. Source Code Audit Findings and Engineering Corrections
 
-| Defect Area | Root Cause in Original Implementation | Technical & Operational Impact |
-| :--- | :--- | :--- |
-| **Global Monkey Patching** | Modified `urllib3.util.connection.create_connection` globally at process level. | Caused cross-session race conditions and thread collisions across workers during parallel downloads. |
-| **Silent Binding Swallowing** | Used `except Exception: pass` around socket binding. | Binding errors fell back silently to the default OS gateway, creating the illusion of bonding while routing all traffic through one NIC. |
-| **Oversized Chunk Vulnerability** | Wrote response body directly to disk without enforcing chunk boundaries. | An oversized chunk response would overwrite data in adjacent chunk offsets on disk, corrupting the final file. |
-| **Race Condition in Cancellation** | `cancel()` deleted temporary files while worker threads were still actively running. | Caused write-after-delete race conditions and unhandled I/O exceptions. |
-| **Misleading Hash Integrity** | Computed a local SHA-256 digest and labeled it "verified" without comparing against an external source. | Gave false assurance of download integrity. |
-| **REST API `NameError`** | Missing `threading` import in `web_server.py`. | Calling `POST /api/refresh` threw an unhandled `NameError` crash. |
-| **Superficial Unit Tests** | Tests checked symbol existence or mock variables rather than issuing real HTTP requests. | Masked functional failures and regression bugs in the API layer. |
+| Defect Area | Severity | Root Cause in Source Implementation | Audit Finding & Correction Applied |
+| :--- | :---: | :--- | :--- |
+| **Path Validation Shortcut** | **P0** | `validate_paths()` declared `independent_egress_proven=True` if gateways differed. | **Fixed:** Eliminated permissive shortcut. Implemented multi-stage classification: `shared_uplink_single_isp`, `distinct_gateways_shared_ip`, and `multi_provider_independent`. Only distinct public IPs yield `independent_egress_proven=True`. |
+| **HTTP Session Binding Fail-Closed** | **P0** | `BoundInterfaceHTTPAdapter` appended socket options without catching subsequent urllib3 connection failures. | **Fixed:** Intercepted connection-level socket errors in `send()` and raised explicit `InterfaceBindingError` (derived from `requests.exceptions.RequestException`) to guarantee fail-closed enforcement. |
+| **Privileged Linux Policy Routing** | **P1** | Automatic `sudo ip rule` during interface discovery risked interactive credential prompts. | **Fixed:** Hardened `_ensure_linux_policy_routing()` to check existing rules first and run non-interactively via `sudo -n`, never blocking discovery. |
+| **Downloader Probe Permissiveness** | **P1** | Probe accepted partial Content-Range substrings without validating representation length. | **Fixed:** Enforced strict RFC 9110 full-match regex (`^bytes\s+0-1/(\d+)$`), checked exact 2-byte body length, and ensured clean single-stream fallback. |
+| **Downloader Concurrency Races** | **P1** | Concurrent worker finalization and cancellation joined workers for 2s then unlinked part files. | **Fixed:** Added `_finalize_lock` for serial finalization; worker session failures propagate immediately to task status `failed`; cancellation checks worker termination before file unlinking. |
+| **Proxy Thread Growth & Error Hiding** | **P1** | Proxy lacked connection bounds and suppressed errors. | **Fixed:** Added `threading.Semaphore(128)` concurrency throttling; added informative logging for DNS/socket errors; explicitly labeled as "Per-Connection Proxy Load Balancing". |
+| **REST API SSRF & Concurrency** | **P1** | `/api/download` accepted private IP destinations without concurrency bounds. | **Fixed:** Added RFC 1918 / loopback target filtering, canonical symlink path validation, and 3-task download concurrency throttling (HTTP 429). |
+| **Benchmark Script Correctness** | **P1** | Progress attributes mismatched, `--trials` was ignored, and units were mislabeled. | **Fixed:** Fixed `progress_pct`, implemented repeated trials averaging, enforced release gate pre-checks, and formatted dual Decimal MB/s and Binary MiB/s. |
 
 ---
 
@@ -38,19 +39,21 @@ At the physical network layer, Windows diagnostic discovery established that whi
 2. **Platform-Specific Hardware Egress Binding:** Configured `SO_BINDTODEVICE` (SOL_SOCKET=25) on Linux/WSL2 and `IP_UNICAST_IF` (IPPROTO_IP=31) on Windows within connection pool socket options.
 3. **Fail-Closed Binding Policy:** Raised explicit `InterfaceBindingError` on binding failure; no silent fallbacks.
 4. **Chunk Boundary Guard (RFC 9110):** Enforced strict HTTP 206 checking, Content-Range regex parsing, and rejected excess bytes before disk writes.
-5. **Clean Worker Cancellation:** Joined worker threads before temporary file removal; ensured cancelled or failed tasks can never be marked `completed`.
+5. **Clean Worker Cancellation & Finalization:** Serialized finalization with `_finalize_lock`; joined worker threads before temporary file removal; ensured cancelled or failed tasks can never be marked `completed`.
 6. **Trusted Digest Verification:** Distinguished `calculated_sha256` from verification against a trusted `expected_sha256`.
-7. **Hardened Local Server:** Bound dashboard and proxy to `127.0.0.1` by default; implemented path traversal blocking (HTTP 403) and SSRF protection.
-8. **Comprehensive Test Suite:** Rewrote `tests/test_speedbond.py` with 15 deterministic tests exercising real HTTP endpoints, socket options, and OS-level hardware counters.
+7. **Hardened Local Server:** Bound dashboard and proxy to `127.0.0.1` by default; implemented path traversal blocking (HTTP 403), SSRF filtering, and concurrency limits.
+8. **Comprehensive Test Suite:** Expanded `tests/test_speedbond.py` to 19 deterministic tests exercising real HTTP endpoints, socket options, path stages, and OS-level hardware counters.
 
 ---
 
 ## 4. Source Files Modified
 
-* [`network_manager.py`](file:///C:/Users/thega/.gemini/antigravity-ide/scratch/speedbond/network_manager.py): Removed global monkey-patching; implemented clean pool-level adapter binding with `SO_BINDTODEVICE` and `IP_UNICAST_IF`; added `InterfaceBindingError`; added dual Windows/WSL interface discovery; added structured egress logging.
-* [`downloader.py`](file:///C:/Users/thega/.gemini/antigravity-ide/scratch/speedbond/downloader.py): Added chunk boundary protection against oversized responses; added trusted vs calculated SHA-256 distinction; added thread join on cancellation.
-* [`web_server.py`](file:///C:/Users/thega/.gemini/antigravity-ide/scratch/speedbond/web_server.py): Fixed missing `threading` import; implemented canonical path traversal validation; added server lifecycle controls (`start_server`, `stop_server`).
-* [`tests/test_speedbond.py`](file:///C:/Users/thega/.gemini/antigravity-ide/scratch/speedbond/tests/test_speedbond.py): Expanded test suite to 15 deterministic tests covering ranges, fallback, mutations, cancellations, binding failures, socket options, and OS hardware counters.
+* [`network_manager.py`](file:///C:/Users/thega/.gemini/antigravity-ide/scratch/speedbond/network_manager.py): Removed global monkey-patching; implemented clean pool-level adapter binding with `SO_BINDTODEVICE` and `IP_UNICAST_IF`; added fail-closed `InterfaceBindingError`; implemented multi-stage path validation; added non-intrusive Linux routing.
+* [`downloader.py`](file:///C:/Users/thega/.gemini/antigravity-ide/scratch/speedbond/downloader.py): Added strict RFC 9110 probe validation; added chunk boundary protection against oversized responses; added trusted vs calculated SHA-256 distinction; added `_finalize_lock` and worker error propagation.
+* [`proxy.py`](file:///C:/Users/thega/.gemini/antigravity-ide/scratch/speedbond/proxy.py): Added 128-connection semaphore concurrency limiter; improved error diagnostics; explicitly labeled as per-connection proxy load balancing.
+* [`web_server.py`](file:///C:/Users/thega/.gemini/antigravity-ide/scratch/speedbond/web_server.py): Fixed missing `threading` import; implemented canonical symlink validation; added SSRF target filtering; added concurrency limits (max 3 downloads).
+* [`benchmark.py`](file:///C:/Users/thega/.gemini/antigravity-ide/scratch/speedbond/benchmark.py): Repaired progress attributes; implemented repeated trials averaging; enforced release gate pre-checks; formatted dual Decimal MB/s and Binary MiB/s.
+* [`tests/test_speedbond.py`](file:///C:/Users/thega/.gemini/antigravity-ide/scratch/speedbond/tests/test_speedbond.py): Expanded test suite to 19 deterministic tests covering ranges, fallback, mutations, cancellations, binding failures, socket options, multistage path validation, probe rejection, worker failures, and SSRF/concurrency limits.
 * [`benchmark.py`](file:///C:/Users/thega/.gemini/antigravity-ide/scratch/speedbond/benchmark.py): Implemented automated dual-WAN benchmarking CLI with Windows `Get-NetAdapterStatistics` delta capture.
 * [`requirements.txt`](file:///C:/Users/thega/.gemini/antigravity-ide/scratch/speedbond/requirements.txt): Pinned core dependencies (`requests>=2.31.0`, `urllib3>=2.0.0`, `pytest>=7.0.0`).
 

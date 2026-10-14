@@ -69,6 +69,12 @@ class SpeedBondServer:
                     return
 
                 if parsed.path == "/api/download":
+                    # Check concurrency limit (max 3 active tasks)
+                    active_tasks = [d for d in sb_self.downloads.values() if d.status in ("probing", "running")]
+                    if len(active_tasks) >= 3:
+                        self._send_json({"error": "Concurrent download limit reached (maximum 3 active downloads)"}, status=429)
+                        return
+
                     url = (data.get("url") or "").strip()
                     if not url:
                         self._send_json({"error": "URL is required"}, status=400)
@@ -84,18 +90,34 @@ class SpeedBondServer:
                         self._send_json({"error": "Invalid URL hostname"}, status=400)
                         return
 
-                    # 2. Prevent path traversal in target filename
-                    raw_filename = (data.get("filename") or os.path.basename(parsed_url.path) or "downloaded_file.bin").strip()
-                    dest_path = os.path.abspath(os.path.join(sb_self.download_dir, raw_filename))
-                    resolved_download_dir = os.path.abspath(sb_self.download_dir)
+                    # SSRF protection: block loopback and private/internal targets unless ALLOW_LOCAL_TEST_DOWNLOADS=1
+                    allow_local = os.environ.get("ALLOW_LOCAL_TEST_DOWNLOADS") == "1"
+                    if not allow_local:
+                        is_blocked = (
+                            hostname in ("localhost", "127.0.0.1", "::1", "0.0.0.0")
+                            or hostname.startswith("127.")
+                            or hostname.startswith("169.254.")
+                            or hostname.startswith("10.")
+                            or hostname.startswith("192.168.")
+                            or (hostname.startswith("172.") and any(hostname.startswith(f"172.{b}.") for b in range(16, 32)))
+                        )
+                        if is_blocked:
+                            self._send_json({"error": "SSRF protection: private and loopback destination addresses are forbidden"}, status=403)
+                            return
 
-                    # Ensure resolved path is strictly inside download_dir
-                    if not dest_path.startswith(resolved_download_dir + os.sep) and dest_path != resolved_download_dir:
+                    # 2. Prevent path traversal in target filename using canonical path resolution
+                    raw_filename = (data.get("filename") or os.path.basename(parsed_url.path) or "downloaded_file.bin").strip()
+                    candidate_path = os.path.join(sb_self.download_dir, raw_filename)
+                    resolved_dest = os.path.realpath(candidate_path)
+                    resolved_dir = os.path.realpath(sb_self.download_dir)
+
+                    # Ensure resolved canonical path is strictly inside download_dir
+                    if not (resolved_dest == resolved_dir or resolved_dest.startswith(resolved_dir + os.sep)):
                         self._send_json({"error": "Path traversal detected: destination outside download directory"}, status=403)
                         return
 
                     task_id = str(uuid.uuid4())[:8]
-                    task = BondedDownloadTask(task_id, url, dest_path, sb_self.net_mgr)
+                    task = BondedDownloadTask(task_id, url, resolved_dest, sb_self.net_mgr)
                     sb_self.downloads[task_id] = task
                     success = task.start()
                     self._send_json({"success": success, "task": task.get_progress()})
@@ -140,6 +162,15 @@ class SpeedBondServer:
     def stop_server(self):
         if hasattr(self, "httpd"):
             self.httpd.shutdown()
+            try:
+                self.httpd.server_close()
+            except Exception:
+                pass
+        for d in self.downloads.values():
+            try:
+                d.cancel()
+            except Exception:
+                pass
 
     def start(self):
         self.httpd = ThreadingHTTPServer((self.host, self.port), self.create_handler())

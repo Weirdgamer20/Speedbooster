@@ -4,6 +4,22 @@ All notable changes to the SpeedBond project are documented in this file.
 
 ---
 
+## [v2.1.1] — 2026-10-14
+
+### Security & Robustness (GitHub Audit Corrections)
+* **Multi-Stage Path Validation (P0):** Rewrote `validate_paths()` in `network_manager.py` to eliminate the permissive shortcut where distinct gateways alone declared `independent_egress_proven = True`. Validation now tracks distinct stages: `interfaces_discovered`, `binding_verified`, `public_egress_observed`, `distinct_gateways`, `distinct_public_ips`, and `validation_stage` (`multi_provider_independent`, `distinct_gateways_shared_ip`, `shared_uplink_single_isp`). `independent_egress_proven` strictly requires `len(distinct_public_ips) >= 2`.
+* **Fail-Closed HTTP Session Binding (P0):** Wrapped `send()` in `BoundInterfaceHTTPAdapter` to intercept low-level socket binding and connection errors, raising `InterfaceBindingError` (derived from `requests.exceptions.RequestException`) to guarantee fail-closed enforcement.
+* **Non-Intrusive Linux Policy Routing (P1):** Hardened `_ensure_linux_policy_routing()` to use non-interactive `sudo -n`, inspecting existing rules before attempting modifications, never prompting for passwords or halting interface discovery.
+* **Strict RFC 9110 Range Probe Validation:** Hardened `probe()` in `downloader.py` using `re.fullmatch(r"bytes\s+0-1/(\d+)", ...)`, validating exact 2-byte slice body length and `total >= 2`.
+* **Downloader Finalization Serialization:** Added `_finalize_lock` in `downloader.py` to eliminate race conditions between concurrent worker completions and cancellation.
+* **Worker Failure Lifecycle Propagation:** Wrapped worker session construction in try/except; unhandled worker failures immediately mark task status as `failed`, trigger cancellation tokens, and notify callbacks.
+* **Proxy Concurrency Limiting & Diagnostic Logging:** Added `threading.Semaphore(128)` to throttle concurrent client connections in `proxy.py`, preventing thread exhaustion. Added verbose logging for DNS/socket/connection failures and explicitly labeled feature as "Per-Connection Proxy Load Balancing".
+* **API SSRF & Concurrency Hardening:** Added target IP filtering in `web_server.py` to block loopback and RFC 1918 private ranges unless explicitly authorized. Added `os.path.realpath()` symlink resolution and a 3-task concurrency throttle (HTTP 429).
+* **Benchmark Tooling Corrections:** Fixed progress attribute discrepancy (`progress_pct`), computed real-time speed, added `--trials N` support, and output dual Decimal MB/s ($10^6$) and Binary MiB/s ($2^{20}$).
+* **Expanded Automated Suite (19/19 Passed):** Added 4 new regression tests covering multi-stage path validation, strict probe rejection, worker setup failure propagation, and API SSRF/concurrency limits. All 19 tests pass in 64.89s.
+
+---
+
 ## [v2.1.0] — 2026-10-14
 
 ### Fixed

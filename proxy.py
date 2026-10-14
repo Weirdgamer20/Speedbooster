@@ -15,7 +15,7 @@ BUFFER_SIZE = 65536  # 64KB per read
 SOCKET_BUFFER = 1048576  # 1MB kernel socket buffer
 
 class MultiWANProxyServer:
-    def __init__(self, net_mgr: NetworkManager, host: str = "127.0.0.1", port: int = 8080):
+    def __init__(self, net_mgr: NetworkManager, host: str = "127.0.0.1", port: int = 8080, max_connections: int = 128):
         self.net_mgr = net_mgr
         self.host = host
         self.port = port
@@ -24,6 +24,7 @@ class MultiWANProxyServer:
         self._thread = None
         self._iface_idx = 0
         self._lock = threading.Lock()
+        self._concurrency_limiter = threading.Semaphore(max_connections)
 
     def _next_interface(self) -> Optional[str]:
         """Picks the next active physical interface in round-robin order."""
@@ -47,7 +48,7 @@ class MultiWANProxyServer:
 
         self._thread = threading.Thread(target=self._accept_loop, daemon=True)
         self._thread.start()
-        print(f"[Proxy] Multi-WAN Proxy listening on {self.host}:{self.port} (Per-Connection Distribution)")
+        print(f"[Proxy] Multi-WAN Proxy listening on {self.host}:{self.port} (Per-Connection Distribution, max {self._concurrency_limiter._value} conns)")
 
     def stop(self):
         self._running = False
@@ -61,7 +62,21 @@ class MultiWANProxyServer:
         while self._running:
             try:
                 client_sock, _ = self.server_sock.accept()
-                t = threading.Thread(target=self._handle_client, args=(client_sock,), daemon=True)
+                if not self._concurrency_limiter.acquire(blocking=False):
+                    try:
+                        client_sock.sendall(b"HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\nProxy concurrency limit exceeded\r\n")
+                        client_sock.close()
+                    except Exception:
+                        pass
+                    continue
+
+                def _run(sock):
+                    try:
+                        self._handle_client(sock)
+                    finally:
+                        self._concurrency_limiter.release()
+
+                t = threading.Thread(target=_run, args=(client_sock,), daemon=True)
                 t.start()
             except Exception:
                 if not self._running:

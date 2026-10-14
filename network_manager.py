@@ -164,7 +164,7 @@ import logging
 
 logger = logging.getLogger("speedbond.network")
 
-class InterfaceBindingError(Exception):
+class InterfaceBindingError(requests.exceptions.RequestException):
     """Raised when an interface or source-IP binding operation fails."""
     pass
 
@@ -214,6 +214,23 @@ class BoundInterfaceHTTPAdapter(HTTPAdapter):
             pool_kwargs["source_address"] = (self.source_ip, 0)
 
         super().init_poolmanager(connections, maxsize, block=block, **pool_kwargs)
+
+    def send(self, request, **kwargs):
+        """Wraps send to ensure socket-level interface or source-address binding failures fail closed."""
+        try:
+            return super().send(request, **kwargs)
+        except Exception as e:
+            err_str = str(e).lower()
+            if (
+                "cannot assign requested address" in err_str
+                or "no such device" in err_str
+                or "invalid argument" in err_str
+                or "bind" in err_str
+            ):
+                raise InterfaceBindingError(
+                    f"Interface socket binding failed on '{self.ifname}' (IP: {self.source_ip}): {e}"
+                ) from e
+            raise
 
 
 class NetworkManager:
@@ -335,13 +352,18 @@ class NetworkManager:
     def _ensure_linux_policy_routing(self, interfaces: List[dict]):
         """
         Configures Linux source-based policy routing (tables 101, 102, ...)
-        so sockets bound to specific interface IPs route strictly out their
-        corresponding physical/mirrored interfaces even on shared subnets.
+        safely and non-intrusively without blocking on interactive credentials.
         """
+        if not sys.platform.startswith("linux") or len(interfaces) < 2:
+            return
+
         try:
-            rule_out = subprocess.check_output(["ip", "rule", "show"], text=True, timeout=5)
+            rule_out = subprocess.check_output(["ip", "rule", "show"], text=True, stderr=subprocess.DEVNULL, timeout=3)
         except Exception:
             rule_out = ""
+
+        is_root = os.geteuid() == 0 if hasattr(os, "geteuid") else False
+        sudo_prefix = [] if is_root else ["sudo", "-n"]
 
         for idx, iface in enumerate(interfaces):
             ip = iface.get("ip")
@@ -350,13 +372,24 @@ class NetworkManager:
             if not ip or not name or not gw:
                 continue
             table_id = 101 + idx
-            if f"from {ip} lookup {table_id}" not in rule_out:
-                try:
-                    subprocess.run(["sudo", "ip", "rule", "add", "from", ip, "table", str(table_id)], check=False, timeout=5)
-                    subprocess.run(["sudo", "ip", "route", "add", "default", "via", gw, "dev", name, "table", str(table_id)], check=False, timeout=5)
+            if f"from {ip} lookup {table_id}" in rule_out:
+                continue
+
+            try:
+                res = subprocess.run(
+                    sudo_prefix + ["ip", "rule", "add", "from", ip, "table", str(table_id)],
+                    check=False, capture_output=True, timeout=3
+                )
+                if res.returncode == 0:
+                    subprocess.run(
+                        sudo_prefix + ["ip", "route", "add", "default", "via", gw, "dev", name, "table", str(table_id)],
+                        check=False, capture_output=True, timeout=3
+                    )
                     logger.info("Configured Linux policy routing: table %d for %s (IP %s via %s)", table_id, name, ip, gw)
-                except Exception as e:
-                    logger.warning("Could not set up policy routing for %s: %s", name, e)
+                else:
+                    logger.debug("Policy routing setup skipped (non-root / credentials required): %s", name)
+            except Exception as e:
+                logger.debug("Could not configure policy routing for %s: %s", name, e)
 
     def discover_interfaces(self) -> List[InterfaceStats]:
         """
@@ -441,23 +474,14 @@ class NetworkManager:
     def validate_paths(self) -> Dict[str, any]:
         """
         Explicit Path Validation Layer (Release Gate Requirement):
-        Proves whether active interfaces use distinct network egress paths.
-        Returns a diagnostic report and validation status.
+        Evaluates discovery, source IP binding, public egress, distinct gateways,
+        and distinct public IPs across separate, verifiable stages.
         """
         active = [i for i in self.interfaces.values() if i.is_active]
-        report = {
-            "interface_count": len(active),
-            "paths": [],
-            "independent_egress_proven": False,
-            "status_message": "",
-        }
-
-        if len(active) < 2:
-            report["status_message"] = f"Only {len(active)} active interface(s) available; multi-path bonding requires at least 2."
-            return report
 
         distinct_public_ips = set()
         distinct_gateways = set()
+        paths = []
 
         for ifstat in active:
             path_info = {
@@ -468,24 +492,55 @@ class NetworkManager:
                 "gateway": ifstat.gateway,
                 "public_ip": ifstat.public_ip,
                 "latency_ms": ifstat.latency_ms,
+                "binding_supported": bool(ifstat.ip),
+                "egress_verified": bool(ifstat.public_ip and ifstat.public_ip not in ["N/A", ""]),
             }
-            report["paths"].append(path_info)
-            if ifstat.public_ip:
+            paths.append(path_info)
+            if ifstat.public_ip and ifstat.public_ip not in ["N/A", ""]:
                 distinct_public_ips.add(ifstat.public_ip)
-            if ifstat.gateway:
+            if ifstat.gateway and ifstat.gateway not in ["N/A", ""]:
                 distinct_gateways.add(ifstat.gateway)
 
-        if len(distinct_public_ips) >= 2 or len(distinct_gateways) >= 2:
-            report["independent_egress_proven"] = True
-            report["status_message"] = "Verified independent network egress paths across interfaces."
+        # Multi-stage evaluation
+        interfaces_discovered = (len(active) >= 2)
+        binding_verified = bool(active and all(i.ip for i in active))
+        public_egress_observed = bool(active and all(i.public_ip and i.public_ip != "N/A" for i in active))
+
+        # P0 CRITICAL RULE: Independent egress requires distinct PUBLIC IPs.
+        # A distinct gateway alone does NOT prove independent WAN uplinks.
+        independent_egress_proven = (len(distinct_public_ips) >= 2 and len(active) >= 2)
+
+        if len(active) < 2:
+            stage = "single_interface" if len(active) == 1 else "no_egress"
+            status_msg = f"Only {len(active)} active interface(s) available; multi-path bonding requires at least 2."
+        elif independent_egress_proven:
+            stage = "multi_provider_independent"
+            status_msg = f"Verified independent multi-WAN egress across {len(active)} paths (Public IPs: {', '.join(sorted(distinct_public_ips))})."
+        elif len(distinct_gateways) >= 2 and len(distinct_public_ips) <= 1:
+            stage = "distinct_gateways_shared_ip"
+            status_msg = (
+                f"NOTICE: Interfaces have distinct local gateways, but share the same public egress IP "
+                f"({next(iter(distinct_public_ips), 'Unknown')}). Multi-WAN bandwidth aggregation is unverified."
+            )
         else:
-            report["independent_egress_proven"] = False
-            report["status_message"] = (
+            stage = "shared_uplink_single_isp"
+            status_msg = (
                 "WARNING: Independent egress cannot be proven. All interfaces share the same gateway and public IP. "
                 "Ensure one adapter connects to Home Wi-Fi and the other to Mobile Hotspot."
             )
 
-        return report
+        return {
+            "interface_count": len(active),
+            "interfaces_discovered": interfaces_discovered,
+            "binding_verified": binding_verified,
+            "public_egress_observed": public_egress_observed,
+            "distinct_gateways": sorted(list(distinct_gateways)),
+            "distinct_public_ips": sorted(list(distinct_public_ips)),
+            "independent_egress_proven": independent_egress_proven,
+            "validation_stage": stage,
+            "status_message": status_msg,
+            "paths": paths,
+        }
 
     def _test_interface_egress(self, ifname: str, source_ip: Optional[str] = None) -> Tuple[Optional[str], float]:
         """

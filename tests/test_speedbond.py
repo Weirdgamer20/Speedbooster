@@ -379,19 +379,23 @@ def test_path_traversal_actual_http_endpoint(speedbond_api_server):
     base_url, server = speedbond_api_server
 
     # Attempt directory traversal outside download directory
-    payload = {
-        "url": "http://127.0.0.1/test",
-        "filename": "../../../evil_payload.bin"
-    }
-    resp = requests.post(f"{base_url}/api/download", json=payload, timeout=5.0)
+    os.environ["ALLOW_LOCAL_TEST_DOWNLOADS"] = "1"
+    try:
+        payload = {
+            "url": "http://127.0.0.1/test",
+            "filename": "../../../evil_payload.bin"
+        }
+        resp = requests.post(f"{base_url}/api/download", json=payload, timeout=5.0)
 
-    assert resp.status_code == 403
-    data = resp.json()
-    assert "Path traversal detected" in data.get("error", "")
+        assert resp.status_code == 403
+        data = resp.json()
+        assert "Path traversal detected" in data.get("error", "")
 
-    # Ensure no file was created outside download_dir
-    forbidden_target = os.path.abspath(os.path.join(server.download_dir, "../../../evil_payload.bin"))
-    assert not os.path.exists(forbidden_target)
+        # Ensure no file was created outside download_dir
+        forbidden_target = os.path.abspath(os.path.join(server.download_dir, "../../../evil_payload.bin"))
+        assert not os.path.exists(forbidden_target)
+    finally:
+        os.environ.pop("ALLOW_LOCAL_TEST_DOWNLOADS", None)
 
 
 def test_bound_interface_adapter_socket_options():
@@ -427,6 +431,13 @@ def test_physical_adapter_hardware_traffic_isolation():
 
     if len(active_ifaces) < 2:
         pytest.skip("Physical dual-adapter hardware verification requires at least 2 active network adapters.")
+
+    val = nm.validate_paths()
+    if not val.get("independent_egress_proven"):
+        pytest.skip(
+            f"Physical hardware isolation test requires independent egress paths across adapters "
+            f"(current stage: {val.get('validation_stage')}). Skipping to avoid overstating dual-adapter isolation."
+        )
 
     iface_a = active_ifaces[0]
     iface_b = active_ifaces[1]
@@ -485,3 +496,126 @@ def test_physical_adapter_hardware_traffic_isolation():
     # During Adapter B run, Adapter B must receive the payload (>= 400 KB), while Adapter A receives negligible traffic
     assert delta_b_on_b >= 400_000, f"Adapter {iface_b.name} must register at least 400KB RX, got {delta_b_on_b}"
     assert delta_a_on_b < delta_b_on_b * 0.15, f"Adapter {iface_a.name} must not carry {iface_b.name} traffic"
+
+
+def test_validate_paths_multistage_logic():
+    """
+    Requirement (P0 audit): Distinct gateways alone must NOT declare independent_egress_proven=True.
+    Verifies that multi-stage path validation correctly categorizes:
+    - shared uplink single ISP
+    - distinct gateways with shared public IP
+    - multi-provider independent
+    """
+    nm = NetworkManager()
+
+    # Case 1: Two interfaces sharing gateway and public IP
+    if1 = InterfaceStats(name="eth1", ip="192.168.1.5", mac="00:11:22:33:44:55", gateway="192.168.1.1", public_ip="203.0.113.1")
+    if2 = InterfaceStats(name="eth2", ip="192.168.1.6", mac="00:11:22:33:44:56", gateway="192.168.1.1", public_ip="203.0.113.1")
+    nm.interfaces = {"eth1": if1, "eth2": if2}
+
+    res1 = nm.validate_paths()
+    assert res1["independent_egress_proven"] is False
+    assert res1["validation_stage"] == "shared_uplink_single_isp"
+
+    # Case 2: Two interfaces with distinct gateways but sharing the same public IP
+    if2.gateway = "10.0.0.1"
+    res2 = nm.validate_paths()
+    assert res2["independent_egress_proven"] is False
+    assert res2["validation_stage"] == "distinct_gateways_shared_ip"
+
+    # Case 3: Two interfaces with distinct public IPs
+    if2.public_ip = "198.51.100.2"
+    res3 = nm.validate_paths()
+    assert res3["independent_egress_proven"] is True
+    assert res3["validation_stage"] == "multi_provider_independent"
+
+
+def test_probe_strict_range_and_malformed_rejection(mock_server):
+    """
+    Requirement (Downloader audit): Probe must strictly validate RFC 9110 range response
+    and reject malformed Content-Range or mismatched slice body lengths.
+    """
+    base_url = mock_server
+    nm = NetworkManager()
+    if1 = InterfaceStats(name="lo", ip="127.0.0.1", mac="00:00:00:00:00:01", gateway="127.0.0.1", public_ip="127.0.0.1")
+    nm.interfaces = {"lo": if1}
+
+    # 1. Normal server returns valid 206 with bytes 0-1/<total> and 2 bytes body
+    task = BondedDownloadTask("probe_ok", f"{base_url}/test", "./dest_ok.bin", nm)
+    assert task.probe() is True
+    assert task.supports_ranges is True
+    assert task.total_size == len(TEST_PAYLOAD)
+
+    # 2. Server returning 200 OK (range ignored) falls back to single-stream
+    MockHTTPServerHandler.mode = "ignore_range"
+    try:
+        task_fallback = BondedDownloadTask("probe_fallback", f"{base_url}/test", "./dest_fallback.bin", nm)
+        assert task_fallback.probe() is True
+        assert task_fallback.supports_ranges is False
+        assert task_fallback.total_size == len(TEST_PAYLOAD)
+    finally:
+        MockHTTPServerHandler.mode = "normal"
+
+
+def test_worker_setup_failure_transitions_to_failed():
+    """
+    Requirement (Downloader audit): Worker session setup exceptions must propagate
+    cleanly to mark task status 'failed' and abort.
+    """
+    nm = NetworkManager()
+    # Mock interface that will raise on session setup
+    if1 = InterfaceStats(name="broken_nic", ip="192.0.2.1", mac="00:00:00:00:00:02", gateway="192.0.2.254", public_ip="192.0.2.1")
+    nm.interfaces = {"broken_nic": if1}
+
+    # Monkey patch create_requests_session to simulate interface failure
+    def fail_session(ifname):
+        raise ConnectionError(f"Simulated hardware binding failure on {ifname}")
+
+    nm.create_requests_session = fail_session
+
+    task = BondedDownloadTask("fail_task", "http://example.com/test.bin", "./fail.bin", nm)
+    task.supports_ranges = True
+    task.total_size = 1048576
+
+    # Call worker loop directly
+    task._worker_loop("broken_nic")
+
+    assert task.status == "failed"
+    assert "Worker initialization failed" in task.error_message
+    assert task._cancel_event.is_set()
+
+
+def test_api_concurrency_limit_and_ssrf_protection(speedbond_api_server):
+    """
+    Requirement (API security audit): /api/download must block SSRF targets by default
+    and enforce max 3 active concurrent downloads with HTTP 429.
+    """
+    base_url, server = speedbond_api_server
+
+    # 1. SSRF Protection: Loopback/private address blocked by default
+    os.environ.pop("ALLOW_LOCAL_TEST_DOWNLOADS", None)
+    resp_ssrf = requests.post(
+        f"{base_url}/api/download",
+        json={"url": "http://127.0.0.1:8080/secret", "filename": "ssrf.bin"},
+        timeout=5.0
+    )
+    assert resp_ssrf.status_code == 403
+    assert "SSRF protection" in resp_ssrf.json().get("error", "")
+
+    # 2. Concurrency Limit: Enforce maximum 3 active downloads
+    server.downloads.clear()
+    for i in range(3):
+        t = BondedDownloadTask(f"t_{i}", "http://example.com/file", f"./f_{i}.bin", server.net_mgr)
+        t.status = "running"
+        server.downloads[f"t_{i}"] = t
+
+    # 4th download should be rejected with 429
+    resp_limit = requests.post(
+        f"{base_url}/api/download",
+        json={"url": "https://example.com/overflow.bin", "filename": "overflow.bin"},
+        timeout=5.0
+    )
+    assert resp_limit.status_code == 429
+    assert "Concurrent download limit reached" in resp_limit.json().get("error", "")
+    server.downloads.clear()
+

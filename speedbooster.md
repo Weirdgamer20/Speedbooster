@@ -373,50 +373,56 @@ In compliance with the **SpeedBond v2.1 Technical Audit & Repair Specification**
 #### Automated Test Matrix Results (pytest 9.0.2 - 15/15 Passed)
 Executed deterministically via local test harness without public internet dependencies:
 ```text
+```text
 ============================= test session starts ==============================
 platform linux -- Python 3.14.4, pytest-9.0.2, pluggy-1.6.0 -- /usr/bin/python3
 cachedir: .pytest_cache
 rootdir: /home/tg/speedbond
 plugins: typeguard-4.4.4
-collecting ... collected 15 items
+collecting ... collected 19 items
 
-tests/test_speedbond.py::test_compilation PASSED                         [  6%]
-tests/test_speedbond.py::test_range_success_with_trusted_checksum PASSED [ 13%]
-tests/test_speedbond.py::test_range_checksum_mismatch PASSED             [ 20%]
-tests/test_speedbond.py::test_ignored_range_safe_fallback PASSED         [ 26%]
-tests/test_speedbond.py::test_wrong_content_range_rejected PASSED        [ 33%]
-tests/test_speedbond.py::test_oversized_body_rejected PASSED             [ 40%]
-tests/test_speedbond.py::test_truncated_body_rejected PASSED             [ 46%]
-tests/test_speedbond.py::test_incorrect_total_size_rejected PASSED       [ 53%]
-tests/test_speedbond.py::test_etag_mutation_detected PASSED              [ 60%]
-tests/test_speedbond.py::test_cancellation_and_worker_termination PASSED [ 66%]
-tests/test_speedbond.py::test_binding_failure_reported PASSED            [ 73%]
-tests/test_speedbond.py::test_refresh_api_real_http_post PASSED          [ 80%]
-tests/test_speedbond.py::test_path_traversal_actual_http_endpoint PASSED [ 86%]
-tests/test_speedbond.py::test_bound_interface_adapter_socket_options PASSED [ 93%]
-tests/test_speedbond.py::test_physical_adapter_hardware_traffic_isolation PASSED [100%]
+tests/test_speedbond.py::test_compilation PASSED                         [  5%]
+tests/test_speedbond.py::test_range_success_with_trusted_checksum PASSED [ 10%]
+tests/test_speedbond.py::test_range_checksum_mismatch PASSED             [ 15%]
+tests/test_speedbond.py::test_ignored_range_safe_fallback PASSED         [ 21%]
+tests/test_speedbond.py::test_wrong_content_range_rejected PASSED        [ 26%]
+tests/test_speedbond.py::test_oversized_body_rejected PASSED             [ 31%]
+tests/test_speedbond.py::test_truncated_body_rejected PASSED             [ 36%]
+tests/test_speedbond.py::test_incorrect_total_size_rejected PASSED       [ 42%]
+tests/test_speedbond.py::test_etag_mutation_detected PASSED              [ 47%]
+tests/test_speedbond.py::test_cancellation_and_worker_termination PASSED [ 52%]
+tests/test_speedbond.py::test_binding_failure_reported PASSED            [ 57%]
+tests/test_speedbond.py::test_refresh_api_real_http_post PASSED          [ 63%]
+tests/test_speedbond.py::test_path_traversal_actual_http_endpoint PASSED [ 68%]
+tests/test_speedbond.py::test_bound_interface_adapter_socket_options PASSED [ 73%]
+tests/test_speedbond.py::test_physical_adapter_hardware_traffic_isolation PASSED [ 78%]
+tests/test_speedbond.py::test_validate_paths_multistage_logic PASSED     [ 84%]
+tests/test_speedbond.py::test_probe_strict_range_and_malformed_rejection PASSED [ 89%]
+tests/test_speedbond.py::test_worker_setup_failure_transitions_to_failed PASSED [ 94%]
+tests/test_speedbond.py::test_api_concurrency_limit_and_ssrf_protection PASSED [100%]
 
-============================= 15 passed in 40.35s ==============================
+======================== 19 passed in 64.89s (0:01:04) =========================
 ```
 
-#### Verified Audit Repairs in v2.1
-1. **P0 Interface Binding & Clean Isolation:**
+#### Verified Audit Repairs in v2.1.1
+1. **P0 Multi-Stage Path Validation:**
+   * Rewrote `validate_paths()` in `network_manager.py` to eliminate the permissive shortcut where distinct gateways alone declared `independent_egress_proven = True`.
+   * Multi-stage classification distinguishes `shared_uplink_single_isp` and `distinct_gateways_shared_ip` from `multi_provider_independent`. Only distinct public IPs yield `independent_egress_proven = True`.
+2. **P0 Interface Binding & Fail-Closed Socket Discipline:**
    * Removed process-global monkey patching of `urllib3.util.connection.create_connection`.
-   * Implemented adapter-specific socket creation and source-address binding via `BoundInterfaceHTTPAdapter(source_ip=...)` and `PoolManager(socket_options=..., source_address=...)`.
+   * Implemented adapter-specific socket creation via `BoundInterfaceHTTPAdapter(source_ip=...)` and `PoolManager(socket_options=..., source_address=...)`.
    * Added `SO_BINDTODEVICE` (Linux/WSL2) and `IP_UNICAST_IF` (Windows) pool socket options for link-level hardware egress.
-   * Prohibited silent failure: binding errors raise explicit `InterfaceBindingError` and `ConnectionError` instead of falling back to default routes.
-   * Structured logging captures: selected interface, source IP, gateway, connection result, and observed local socket address.
-2. **P0 Downloader Integrity & Byte Bounds (RFC 9110):**
-   * Validates HTTP 206 status, Content-Range start/end/total, expected body length, and ETag/Last-Modified consistency.
-   * Rejects excess bytes before they can overwrite adjacent chunks on disk.
-   * Enforces finite retries (max 3 with jittered exponential backoff), joining worker threads before temporary `.speedbond_part` files are deleted.
-   * Distinguishes calculated SHA-256 digests from verification against external trusted expected checksums.
-   * Prohibits failed or cancelled tasks from ever reaching the `completed` state.
-3. **P1 REST API Security & True HTTP Endpoint Tests:**
-   * `/api/refresh` tested via real HTTP POST, verifying non-blocking execution without NameError.
-   * Path traversal tested directly through HTTP POST `/api/download`, returning HTTP 403 Forbidden on directory breakout attempts.
-4. **P1 Hardware Isolation & Counter Verification:**
-   * Automated tests verify per-connection-pool socket options and kernel network counter isolation (`/proc/net/dev` / `Get-NetAdapterStatistics`).
+   * Prohibited silent failure: wrapped `send()` in `BoundInterfaceHTTPAdapter` to catch socket errors and raise explicit `InterfaceBindingError` (`requests.exceptions.RequestException`).
+3. **P1 Downloader Integrity & Concurrency Hardening (RFC 9110):**
+   * Validates HTTP 206 status, Content-Range regex (`^bytes\s+0-1/(\d+)$`), and exact 2-byte slice length during probe.
+   * Serialized finalization with `_finalize_lock` to prevent worker race conditions.
+   * Worker session construction exceptions immediately transition task status to `failed` and signal abort tokens.
+   * Cancellation joins worker threads before temporary files are unlinked.
+4. **P1 Proxy & API Security Hardening:**
+   * Added 128-connection semaphore concurrency limiter in `proxy.py`, with informative DNS/socket error logging; explicitly labeled as per-connection proxy load balancing.
+   * Added SSRF target IP filtering, canonical symlink validation, and 3-task download concurrency throttling (HTTP 429) in `web_server.py`.
+5. **P1 Benchmark Tooling Corrections:**
+   * Fixed progress attribute (`progress_pct`), added dynamic rate calculation, implemented repeated trials averaging (`--trials N`), and formatted dual Decimal MB/s ($10^6$) and Binary MiB/s ($2^{20}$).
 
 ---
 
