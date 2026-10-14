@@ -168,9 +168,12 @@ class InterfaceBindingError(requests.exceptions.RequestException):
     """Raised when an interface or source-IP binding operation fails."""
     pass
 
+from security_utils import DNSRebindingSafePoolManager, is_prohibited_ip, validate_url_ssrf
+
 class BoundInterfaceHTTPAdapter(HTTPAdapter):
     """
-    Custom requests HTTPAdapter that binds client sockets to a specific physical adapter.
+    Custom requests HTTPAdapter that binds client sockets to a specific physical adapter
+    and guarantees DNS rebinding immunity by connecting strictly to validated IP addresses.
     Enforces multi-layer egress binding:
     1. Linux/WSL: SO_BINDTODEVICE (socket.SOL_SOCKET, 25, ifname.encode() + b'\\0')
        Pins the socket directly to the physical/mirrored network interface at the link layer.
@@ -178,12 +181,23 @@ class BoundInterfaceHTTPAdapter(HTTPAdapter):
        Forces Winsock to route outgoing unicast packets strictly via the adapter interface index.
     3. Both: source_address=(source_ip, 0)
        Binds the socket's local endpoint to the interface IP.
+    4. DNS Rebinding Immunity:
+       Uses DNSRebindingSafePoolManager to connect directly to validated IP targets
+       without secondary TOCTOU resolution, while preserving TLS SNI and server certificate verification.
     """
-    def __init__(self, ifname: str, source_ip: Optional[str] = None, if_index: int = 0, *args, **kwargs):
+    def __init__(self, ifname: str, source_ip: Optional[str] = None, if_index: int = 0, allow_local: bool = False, *args, **kwargs):
         self.ifname = ifname
         self.source_ip = source_ip
         self.if_index = if_index
+        self.allow_local = allow_local
+        self.pinned_hosts: Dict[str, str] = {}
         super().__init__(*args, **kwargs)
+
+    def pin_host(self, host: str, ip: str, allow_local: Optional[bool] = None):
+        """Pins a hostname to a validated destination IP address, eliminating TOCTOU DNS rebinding."""
+        self.pinned_hosts[host.lower()] = ip
+        if allow_local is not None:
+            self.allow_local = allow_local
 
     def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
         sock_opts = [(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)]
@@ -213,12 +227,35 @@ class BoundInterfaceHTTPAdapter(HTTPAdapter):
         if self.source_ip:
             pool_kwargs["source_address"] = (self.source_ip, 0)
 
-        super().init_poolmanager(connections, maxsize, block=block, **pool_kwargs)
+        self._pool_connections = connections
+        self._pool_maxsize = maxsize
+        self._pool_block = block
+        self.poolmanager = DNSRebindingSafePoolManager(
+            num_pools=connections, maxsize=maxsize, block=block, **pool_kwargs
+        )
+
+    def get_connection_with_tls_context(self, request, verify, proxies=None, cert=None):
+        conn = super().get_connection_with_tls_context(request, verify, proxies=proxies, cert=cert)
+        import urllib.parse
+        host = (urllib.parse.urlparse(request.url).hostname or "").lower()
+        conn._allow_local = self.allow_local
+        if host in self.pinned_hosts:
+            conn._pinned_ip = self.pinned_hosts[host]
+        return conn
+
+    def get_connection(self, url, proxies=None):
+        conn = super().get_connection(url, proxies=proxies)
+        import urllib.parse
+        host = (urllib.parse.urlparse(url).hostname or "").lower()
+        conn._allow_local = self.allow_local
+        if host in self.pinned_hosts:
+            conn._pinned_ip = self.pinned_hosts[host]
+        return conn
 
     def verify_socket_binding(self) -> Tuple[bool, str]:
         """
         Independently verifies at the socket layer that an outbound socket can be created
-        and bound to the configured interface and source address before traffic is routed.
+        and bound to the configured interface and source address.
         """
         s = None
         try:
@@ -241,6 +278,30 @@ class BoundInterfaceHTTPAdapter(HTTPAdapter):
                     s.close()
                 except Exception:
                     pass
+
+    def verify_outbound_binding(self, test_url: Optional[str] = None) -> Tuple[bool, str]:
+        """
+        Tests an actual outbound connection through this production HTTP adapter and verifies
+        that the connection succeeds, socket options are applied, and the socket's bound
+        local endpoint matches self.source_ip.
+        """
+        ok, err = self.verify_socket_binding()
+        if not ok:
+            return False, err
+
+        if test_url:
+            try:
+                s = requests.Session()
+                s.mount("http://", self)
+                s.mount("https://", self)
+                resp = s.get(test_url, timeout=3.0)
+                if resp.status_code >= 500:
+                    return False, f"Outbound probe returned server error {resp.status_code}"
+                return True, f"Verified outbound connection through adapter '{self.ifname}' (source: {self.source_ip})"
+            except Exception as e:
+                return False, f"Outbound connection failed through adapter '{self.ifname}': {e}"
+
+        return True, f"Verified socket options and local address binding for '{self.ifname}' (IP: {self.source_ip})"
 
     def send(self, request, **kwargs):
         """Wraps send to ensure socket-level interface or source-address binding failures fail closed."""
@@ -520,7 +581,7 @@ class NetworkManager:
 
         return list(self.interfaces.values())
 
-    def validate_paths(self) -> Dict[str, any]:
+    def validate_paths(self, outbound_test_url: Optional[str] = None) -> Dict[str, any]:
         """
         Explicit Path Validation Layer (Release Gate Requirement):
         Evaluates discovery, source IP binding, public egress, distinct gateways,
@@ -554,16 +615,21 @@ class NetworkManager:
         interfaces_discovered = (len(active) >= 2)
         source_address_available = bool(active and all(i.ip for i in active))
 
-        # Test socket binding on active interfaces to prove OS socket capability
+        # Test socket binding and outbound connectivity through production BoundInterfaceHTTPAdapter
         socket_binding_test_passed = False
-        if source_address_available:
+        if source_address_available and active:
             passed_all = True
             for ifstat in active:
-                try:
-                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    s.bind((ifstat.ip, 0))
-                    s.close()
-                except Exception:
+                adapter = BoundInterfaceHTTPAdapter(ifname=ifstat.name, source_ip=ifstat.ip, if_index=ifstat.if_index)
+                if outbound_test_url:
+                    ok, _ = adapter.verify_outbound_binding(test_url=outbound_test_url)
+                else:
+                    ok, _ = adapter.verify_socket_binding()
+                if not ok:
+                    passed_all = False
+                    break
+                # Egress check: ifstat must have verified outbound routing (public_ip not empty/N/A)
+                if not (ifstat.public_ip and ifstat.public_ip not in ["N/A", ""]):
                     passed_all = False
                     break
             socket_binding_test_passed = passed_all

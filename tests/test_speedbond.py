@@ -35,7 +35,14 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from network_manager import NetworkManager, InterfaceStats, BoundInterfaceHTTPAdapter, InterfaceBindingError
 from downloader import BondedDownloadTask, ChunkVerificationError, ResourceChangedError
 from web_server import SpeedBondServer
-from security_utils import validate_url_ssrf, is_prohibited_ip, safe_request_get
+from security_utils import (
+    validate_url_ssrf,
+    is_prohibited_ip,
+    safe_request_get,
+    resolve_and_validate_host,
+    DNSRebindingSafePoolManager,
+)
+from benchmark import get_target_nic_names, compute_statistics, welch_t_test
 
 # 4MB deterministic test payload
 TEST_PAYLOAD = b"SpeedBondDeterministicPayload_0123456789ABCDEF\n" * (4 * 1024 * 1024 // 48)
@@ -809,5 +816,117 @@ def test_api_concurrency_limit_and_ssrf_protection(speedbond_api_server):
     assert resp_limit.status_code == 429
     assert "Concurrent download limit reached" in resp_limit.json().get("error", "")
     server.downloads.clear()
+
+
+def test_dns_rebinding_defense_pins_ip_and_preserves_tls(mock_server):
+    """
+    Requirement (High audit finding): Prevent DNS rebinding (TOCTOU).
+    Connections must bind directly to a pre-validated IP address without secondary DNS
+    resolution, eliminating TOCTOU DNS rebinding, while preserving correct TLS hostname
+    verification.
+    """
+    # 1. Test resolve_and_validate_host directly
+    ip = resolve_and_validate_host("127.0.0.1", port=80, allow_local=True)
+    assert ip == "127.0.0.1"
+
+    ip_pub = resolve_and_validate_host("example.com", port=80, allow_local=False)
+    assert ip_pub is not None
+
+    # Host resolving to private IP rejected when allow_local=False
+    with pytest.raises(requests.exceptions.RequestException) as exc_priv:
+        resolve_and_validate_host("127.0.0.1", port=80, allow_local=False)
+    assert "SSRF" in str(exc_priv.value)
+
+    # 2. DNSRebindingSafePoolManager with pinned IP connects directly
+    session = requests.Session()
+    adapter = BoundInterfaceHTTPAdapter(ifname="lo", source_ip="127.0.0.1", allow_local=True)
+    # Pin mock server hostname to 127.0.0.1
+    adapter.pin_host("127.0.0.1", "127.0.0.1", allow_local=True)
+    session.mount("http://", adapter)
+
+    resp = session.get(f"{mock_server}/", timeout=2.0)
+    assert resp.status_code == 200
+    assert len(resp.content) > 0
+
+    # 3. safe_request_get uses DNS rebinding defense and verifies each redirect hop
+    resp_safe = safe_request_get(session, f"{mock_server}/", allow_local=True, timeout=2.0)
+    assert resp_safe.status_code == 200
+
+    # If redirect target points to prohibited internal IP, it is blocked before connection
+    with pytest.raises(requests.exceptions.RequestException) as exc_info:
+        safe_request_get(session, f"{mock_server}/redirect_to_internal", allow_local=False, timeout=2.0)
+    assert "SSRF violation" in str(exc_info.value)
+
+
+def test_production_adapter_outbound_binding_verification(mock_server):
+    """
+    Requirement (High audit finding): Prove interface binding using actual outbound
+    connections via the production BoundInterfaceHTTPAdapter.
+    Verify socket source address matches bound IP rather than relying on dummy local UDP binds.
+    """
+    # 1. Valid loopback adapter verifies successfully with outbound HTTP probe
+    adapter_valid = BoundInterfaceHTTPAdapter(ifname="lo", source_ip="127.0.0.1", allow_local=True)
+    adapter_valid.pin_host("127.0.0.1", "127.0.0.1", allow_local=True)
+    ok, msg = adapter_valid.verify_outbound_binding(test_url=f"{mock_server}/")
+    assert ok is True
+    assert "Verified outbound" in msg
+
+    # 2. Invalid source IP fails outbound verification without unhandled exceptions
+    adapter_invalid = BoundInterfaceHTTPAdapter(ifname="eth0", source_ip="198.51.100.254")
+    ok_inv, msg_inv = adapter_invalid.verify_outbound_binding(test_url=f"{mock_server}/")
+    assert ok_inv is False
+    assert "Socket binding verification failed" in msg_inv or "Outbound connection failed" in msg_inv
+
+    # 3. NetworkManager validate_paths includes socket_binding_test_passed logic based on production adapters
+    nm = NetworkManager()
+    paths_res = nm.validate_paths(outbound_test_url=f"{mock_server}/")
+    assert isinstance(paths_res, dict)
+    assert "socket_binding_test_passed" in paths_res
+    assert "independent_egress_proven" in paths_res
+    # On single-uplink / local test, independent egress is strictly False
+    assert paths_res["independent_egress_proven"] is False
+
+
+def test_benchmark_hardware_attribution_and_statistical_testing():
+    """
+    Requirement (Medium audit findings):
+    1. Benchmark hardware attribution: Map OS counters to selected physical NICs,
+       isolate background traffic, and require both adapters to carry >= 15% (and sum >= 70%)
+       of bytes attributable to the benchmark.
+    2. Statistical testing: Report distribution (mean, std dev, std err, 95% CI) and
+       use Welch's t-test before claiming statistically significant improvement.
+    """
+    # 1. Interface mapping
+    nm = NetworkManager()
+    target_nics = get_target_nic_names(nm, ["eth0", "eth1"])
+    assert "eth0" in target_nics
+    assert "eth1" in target_nics
+
+    # 2. Statistical calculations
+    runs_a = [10.0, 10.5, 9.8, 10.2, 10.1]
+    stats_a = compute_statistics(runs_a)
+    assert stats_a["n"] == 5
+    assert abs(stats_a["mean"] - 10.12) < 0.05
+    assert stats_a["std_dev"] > 0
+    assert stats_a["ci95_upper"] >= stats_a["mean"]
+    assert stats_a["ci95_lower"] <= stats_a["mean"]
+
+    # Statistical test: identical or overlapping distributions should not be significant
+    t_stat, is_sig = welch_t_test(runs_a, runs_a)
+    assert is_sig is False
+    assert t_stat == 0.0
+
+    # Distinct distributions: significant difference
+    runs_b = [20.0, 20.5, 19.8, 20.2, 20.1]
+    t_stat_b, is_sig_b = welch_t_test(runs_b, runs_a)
+    assert is_sig_b is True
+    assert t_stat_b > 2.0
+
+    # Single-run edge case (N=1) cannot compute std dev or claim statistical significance
+    single_stat = compute_statistics([15.0])
+    assert single_stat["n"] == 1
+    assert single_stat["std_dev"] == 0.0
+    _, single_sig = welch_t_test([20.0], [10.0])
+    assert single_sig is False
 
 

@@ -1,14 +1,19 @@
 """
-security_utils.py - Centralized SSRF validation and safe redirect-handling utilities.
-Validates all IPv4/IPv6 addresses against loopback, private, link-local, multicast,
-and reserved ranges via DNS resolution, and enforces safe redirect traversal.
+security_utils.py - Centralized SSRF validation, DNS rebinding defense, and safe redirect traversal.
+Guarantees that destination sockets connect strictly to validated IP addresses without
+secondary DNS resolution TOCTOU races, while preserving correct TLS SNI and certificate validation.
 """
 
 import socket
 import ipaddress
 import urllib.parse
-from typing import Tuple, List, Optional
+from typing import Tuple, List, Optional, Dict
 import requests
+import urllib3
+from urllib3.connection import HTTPConnection, HTTPSConnection
+from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
+from urllib3.poolmanager import PoolManager
+
 
 def is_prohibited_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     """Checks whether an IP address belongs to private, loopback, link-local, multicast, or reserved ranges."""
@@ -28,6 +33,7 @@ def is_prohibited_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
         return is_prohibited_ip(ip.ipv4_mapped)
     return False
+
 
 def validate_url_ssrf(url: str, allow_local: bool = False) -> Tuple[bool, str, List[str]]:
     """
@@ -123,16 +129,108 @@ def validate_url_ssrf(url: str, allow_local: bool = False) -> Tuple[bool, str, L
     return True, "", resolved_ips
 
 
+def resolve_and_validate_host(host: str, port: int = 80, allow_local: bool = False) -> str:
+    """
+    Resolves hostname and verifies that no returned A/AAAA record targets prohibited network spaces.
+    Returns the first verified IP address or raises RequestException.
+    """
+    clean_host = host.strip("[]").lower()
+    if allow_local and clean_host in ("127.0.0.1", "localhost", "::1"):
+        return "127.0.0.1"
+
+    url = f"http://{host}:{port}/"
+    is_valid, err_msg, resolved_ips = validate_url_ssrf(url, allow_local=allow_local)
+    if not is_valid or not resolved_ips:
+        raise requests.exceptions.RequestException(f"SSRF / DNS rebinding security rejection for '{host}': {err_msg}")
+    return resolved_ips[0]
+
+
+class DNSRebindingSafeHTTPConnection(HTTPConnection):
+    """
+    HTTPConnection that binds directly to a pre-validated IP address,
+    preventing secondary DNS resolution and TOCTOU DNS rebinding.
+    """
+    def _new_conn(self) -> socket.socket:
+        target_ip = getattr(self, "_pinned_ip", None)
+        allow_local = getattr(self, "_allow_local", False)
+        if not target_ip:
+            target_ip = resolve_and_validate_host(self.host, self.port, allow_local=allow_local)
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        for opt in self.socket_options:
+            try:
+                s.setsockopt(*opt)
+            except Exception:
+                pass
+        if self.source_address:
+            s.bind(self.source_address)
+
+        s.settimeout(self.timeout)
+        s.connect((target_ip, self.port))
+        return s
+
+
+class DNSRebindingSafeHTTPSConnection(HTTPSConnection):
+    """
+    HTTPSConnection that binds directly to a pre-validated IP address,
+    guaranteeing that destination IP is one of the validated addresses
+    while preserving TLS SNI and server certificate hostname verification.
+    """
+    def _new_conn(self) -> socket.socket:
+        target_ip = getattr(self, "_pinned_ip", None)
+        allow_local = getattr(self, "_allow_local", False)
+        if not target_ip:
+            target_ip = resolve_and_validate_host(self.host, self.port, allow_local=allow_local)
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        for opt in self.socket_options:
+            try:
+                s.setsockopt(*opt)
+            except Exception:
+                pass
+        if self.source_address:
+            s.bind(self.source_address)
+
+        s.settimeout(self.timeout)
+        s.connect((target_ip, self.port))
+        return s
+
+
+class DNSRebindingSafeHTTPPool(HTTPConnectionPool):
+    ConnectionCls = DNSRebindingSafeHTTPConnection
+
+
+class DNSRebindingSafeHTTPSPool(HTTPSConnectionPool):
+    ConnectionCls = DNSRebindingSafeHTTPSConnection
+
+
+class DNSRebindingSafePoolManager(PoolManager):
+    """PoolManager that routes all HTTP/HTTPS traffic through DNS rebinding-safe connection pools."""
+    pool_classes_by_scheme = {
+        "http": DNSRebindingSafeHTTPPool,
+        "https": DNSRebindingSafeHTTPSPool
+    }
+
+
 def safe_request_get(session: requests.Session, url: str, allow_local: bool = False, max_redirects: int = 5, **kwargs) -> requests.Response:
     """
-    Issues a GET request with strict step-by-step SSRF validation across all redirect hops.
-    Rejects any redirect attempting to pivot to private/loopback/link-local networks.
+    Issues a GET request with strict step-by-step SSRF validation and DNS pinning across all redirect hops.
+    Guarantees destination IP is one of the validated addresses, preventing DNS rebinding pivots.
     """
     current_url = url
     for hop in range(max_redirects + 1):
-        is_valid, err_msg, _ = validate_url_ssrf(current_url, allow_local=allow_local)
+        is_valid, err_msg, resolved_ips = validate_url_ssrf(current_url, allow_local=allow_local)
         if not is_valid:
             raise requests.exceptions.RequestException(f"SSRF violation on hop {hop} ({current_url}): {err_msg}")
+
+        parsed = urllib.parse.urlparse(current_url)
+        clean_host = parsed.hostname.strip("[]").lower()
+        pinned_ip = resolved_ips[0] if resolved_ips else clean_host
+
+        # Pin validated IP into adapters mounted on the session
+        for prefix, adapter in session.adapters.items():
+            if hasattr(adapter, "pin_host"):
+                adapter.pin_host(clean_host, pinned_ip, allow_local=allow_local)
 
         # Disable requests automatic redirection so we can validate each hop manually
         kwargs["allow_redirects"] = False

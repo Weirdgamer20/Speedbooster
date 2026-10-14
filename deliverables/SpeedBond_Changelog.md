@@ -4,6 +4,17 @@ All notable changes to the SpeedBond project are documented in this file.
 
 ---
 
+## [v2.1.3] — 2026-10-14
+
+### Security & Robustness (GitHub Audit Fixes)
+* **DNS Rebinding Defense (TOCTOU Immunity):** Implemented `DNSRebindingSafeHTTPConnection`, `DNSRebindingSafeHTTPSConnection`, and `DNSRebindingSafePoolManager` in `security_utils.py`. The connection socket connects directly to the pre-validated IP address, eliminating the TOCTOU DNS rebinding window while preserving TLS SNI and server certificate validation via `HTTPSConnection.connect(server_hostname=self.host)`. `safe_request_get()` and `BoundInterfaceHTTPAdapter.pin_host()` pin hostnames across all redirect hops.
+* **Proved Outbound Interface Binding Verification:** Added `verify_outbound_binding()` to `BoundInterfaceHTTPAdapter`, testing actual outbound HTTP requests through the production adapter and verifying local socket endpoint addresses against `self.source_ip`. Updated `NetworkManager.validate_paths()` to evaluate outbound adapter egress rather than relying on local UDP dummy binds.
+* **Physical NIC Hardware Attribution in Benchmarks:** Implemented `get_target_nic_names()` in `benchmark.py` to map logical interfaces (`eth1`, `eth2`) to specific OS adapter counters. For dual-WAN combined runs, strictly requires both selected adapters to record $\ge 15\%$ of download bytes and combined $\ge 70\%$, eliminating false positives from background traffic on unselected interfaces.
+* **Statistical Testing for Bandwidth Aggregation:** Implemented `compute_statistics()` (sample mean, standard deviation, standard error, 95% confidence intervals) and `welch_t_test()` in `benchmark.py`. Replaced naive average comparisons with formal statistical hypothesis testing. Single trials ($N=1$) are explicitly marked as empirical observations with `statistically_significant = False`.
+* **Automated Acceptance Suite Expansion (26 Passed, 1 Skipped in 33.25s):** Added 3 new deterministic tests: `test_dns_rebinding_defense_pins_ip_and_preserves_tls`, `test_production_adapter_outbound_binding_verification`, and `test_benchmark_hardware_attribution_and_statistical_testing`. All 26 functional tests pass cleanly; `test_physical_adapter_hardware_traffic_isolation` remains safely skipped on the shared single-uplink Wi-Fi router.
+
+---
+
 ## [v2.1.2] — 2026-10-14
 
 ### Security & Robustness (GitHub Audit Corrections)

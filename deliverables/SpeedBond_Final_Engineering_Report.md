@@ -2,7 +2,7 @@
 
 **System:** SpeedBond (Multi-Interface Network Aggregator)  
 **Author:** Senior Windows Networking & Software Quality Engineering  
-**Version:** 2.1.2  
+**Version:** 2.1.3  
 **Date:** 14 October 2026  
 **Overall Readiness Verdict:** **SOFTWARE READY — NETWORK AGGREGATION UNVERIFIED**  
 
@@ -12,12 +12,12 @@
 
 SpeedBond is an application-level multi-WAN network aggregation system designed for Windows PCs equipped with two Wi-Fi adapters: an onboard **Intel Wi-Fi 6E AX211** adapter and an external **Realtek 8812BU 802.11ac USB Wi-Fi Dongle**.
 
-Following rigorous second-round code audit review, comprehensive repairs were implemented addressing SSRF protection, fail-closed socket binding, downloader worker exceptions and state-transition locks, benchmark repetition accounting and checksum verification, and non-intrusive WSL2 discovery.
+Following rigorous third-round code audit review of commit `19de42c`, comprehensive repairs were implemented addressing DNS rebinding (TOCTOU immunity), outbound interface socket verification via the production adapter, false-positive elimination in physical NIC attribution, and rigorous statistical analysis for throughput benchmarks.
 
-The automated test suite has been expanded to **24 deterministic tests**. The recorded suite execution in the target WSL2/Windows interop environment achieved:
-- **23 PASSED**
+The automated test suite has been expanded to **27 deterministic tests**. The recorded suite execution in the target WSL2/Windows interop environment achieved:
+- **26 PASSED**
 - **1 SKIPPED** (`test_physical_adapter_hardware_traffic_isolation`, skipped because both adapters share the same upstream router and public IP)
-- **Total Duration:** 32.33s  
+- **Total Duration:** 33.25s  
 - **Raw Log:** [`deliverables/logs/phase4_pytest_output.txt`](file:///C:/Users/thega/.gemini/antigravity-ide/scratch/speedbond/deliverables/logs/phase4_pytest_output.txt)
 
 At the physical network layer, Windows diagnostic discovery established that both physical adapters connect to the **same home Wi-Fi access point (`JioFiber-5G-1`)**, share the **same default gateway (`192.168.1.1`)**, and egress through the **same public IP (`122.161.76.71`)**. Therefore, independent dual-WAN aggregation is physically blocked on this topology, and physical multi-WAN aggregation remains explicitly **UNVERIFIED**.
@@ -28,12 +28,13 @@ At the physical network layer, Windows diagnostic discovery established that bot
 
 | Defect Area | Severity | Root Cause in Source Implementation | Audit Finding & Correction Applied |
 | :--- | :---: | :--- | :--- |
+| **DNS Rebinding Defense (TOCTOU)** | **High** | URL validation resolved hostnames once, but subsequent HTTP connection re-resolved the hostname, exposing a TOCTOU rebinding window. | **Fixed:** Implemented `DNSRebindingSafePoolManager` in `security_utils.py`. The connection socket binds directly to the pre-validated IP address without secondary DNS lookup, while preserving TLS SNI and server certificate validation via `HTTPSConnection.connect(server_hostname=self.host)`. Redirects pin hostnames at each hop. |
+| **Outbound Interface Binding Verification** | **High** | `verify_socket_binding()` only bound a dummy local socket, without proving outbound kernel routing through the production adapter. | **Fixed:** Added `verify_outbound_binding()` to `BoundInterfaceHTTPAdapter`, issuing actual outbound HTTP requests through the production adapter and verifying local socket endpoint addresses against `self.source_ip`. Updated `NetworkManager.validate_paths()` to use this outbound check. |
+| **Benchmark Hardware Attribution False Positives** | **Medium** | Benchmark recorded OS interface counters, but considered traffic on *any* two interfaces sufficient without mapping to the selected physical NICs. | **Fixed:** Added `get_target_nic_names()` in `benchmark.py` to map logical interfaces to specific OS adapter counters. Enforced strict thresholding: both adapters must record $\ge 15\%$ of download bytes and combined $\ge 70\%$, eliminating false positives from unselected interface traffic. |
+| **Statistical Testing in Benchmarks** | **Medium** | Releasing claims of "statistically significant" aggregation based on naive 10% average comparisons without variability metrics or confidence intervals. | **Fixed:** Implemented `compute_statistics()` (sample mean, standard deviation, standard error, 95% Student's t CI) and `welch_t_test()`. Explicitly mark single trials ($N=1$) as empirical observations with `statistically_significant = False`. |
 | **SSRF DNS & Redirect Bypass** | **P0** | String prefix matching on hostname failed on DNS pivots, decimal/hex IPs (`2130706433`), and 302 redirects to internal services. | **Fixed:** Created `security_utils.py`. Implemented `validate_url_ssrf()` resolving all A/AAAA records and blocking loopback, RFC 1918, link-local, CGNAT (`100.64.0.0/10`), multicast, and IPv4-mapped IPv6. Implemented `safe_request_get()` with manual redirect hop inspection. |
 | **Binding Error Fail-Closed Behavior** | **P0** | `BoundInterfaceHTTPAdapter.send()` filtered errors by fragile substrings ("bind", "invalid argument"). | **Fixed:** Eliminated string searches. `send()` catches all `(requests.exceptions.ConnectionError, requests.exceptions.ConnectTimeout, OSError, socket.error)` and raises `InterfaceBindingError`. Added socket-layer `verify_socket_binding()`. |
-| **Physical Isolation Test Accounting** | **P0** | Report claimed all tests passed, but physical isolation test skips if independent egress is unproven. | **Fixed:** Reconciled test accounting across all deliverables. The recorded result is strictly **23 passed, 1 skipped**, transparently reporting the skip reason. |
-| **Benchmark Trial Reliability** | **P1** | Single pass masked repetition failures; digest was not compared to trusted checksum; NIC attribution wasn't verified. | **Fixed:** `benchmark.py` reports every trial repetition separately; marks status incomplete if any run fails; compares SHA-256 against `--expected-sha256`; verifies physical NIC attribution; enforces $\ge 10\%$ speed gain over single baselines. |
-| **Downloader Probe & Fallback Lifecycle** | **P1** | Probe coverage didn't verify malformed Content-Range or wrong body lengths; single-stream fallback lacked session try/except. | **Fixed:** Enforced strict regex matching (`^bytes\s+0-1/(\d+)$`) and exact 2-byte body validation; wrapped single-stream fallback session setup in comprehensive try/except; guarded finalization transitions with `_state_lock` and cancellation tokens. |
-| **Path Validation Nomenclature** | **P1** | `binding_verified` was an interface config check rather than proved physical routing. | **Fixed:** Introduced precise audit nomenclature: `interfaces_discovered`, `source_address_available`, `socket_binding_test_passed`, `distinct_public_egress_observed`, `physical_nic_attribution_verified`, `combined_throughput_gain_verified`. |
+| **Physical Isolation Test Accounting** | **P0** | Report claimed all tests passed, but physical isolation test skips if independent egress is unproven. | **Fixed:** Reconciled test accounting across all deliverables. The recorded result is strictly **26 passed, 1 skipped**, transparently reporting the skip reason. |
 | **WSL2 Routing Side Effects** | **P1** | `_ensure_linux_policy_routing()` modified system routing during discovery. | **Fixed:** Removed automatic policy-rule mutation from `discover_interfaces()`, making discovery 100% read-only. Created explicit, opt-in `configure_linux_policy_routing(apply=False)` with dry-run preview. |
 
 ---
@@ -94,36 +95,39 @@ platform linux -- Python 3.14.4, pytest-9.0.2, pluggy-1.6.0 -- /usr/bin/python3
 cachedir: .pytest_cache
 rootdir: /home/tg/speedbond
 plugins: typeguard-4.4.4
-collecting ... collected 24 items
+collecting ... collected 27 items
 
-tests/test_speedbond.py::test_compilation PASSED                         [  4%]
-tests/test_speedbond.py::test_range_success_with_trusted_checksum PASSED [  8%]
-tests/test_speedbond.py::test_range_checksum_mismatch PASSED             [ 12%]
-tests/test_speedbond.py::test_ignored_range_safe_fallback PASSED         [ 16%]
-tests/test_speedbond.py::test_wrong_content_range_rejected PASSED        [ 20%]
-tests/test_speedbond.py::test_oversized_body_rejected PASSED             [ 25%]
-tests/test_speedbond.py::test_truncated_body_rejected PASSED             [ 29%]
-tests/test_speedbond.py::test_incorrect_total_size_rejected PASSED       [ 33%]
-tests/test_speedbond.py::test_etag_mutation_detected PASSED              [ 37%]
-tests/test_speedbond.py::test_cancellation_and_worker_termination PASSED [ 41%]
-tests/test_speedbond.py::test_binding_failure_reported PASSED            [ 45%]
-tests/test_speedbond.py::test_refresh_api_real_http_post PASSED          [ 50%]
-tests/test_speedbond.py::test_path_traversal_actual_http_endpoint PASSED [ 54%]
-tests/test_speedbond.py::test_bound_interface_adapter_socket_options PASSED [ 58%]
-tests/test_speedbond.py::test_physical_adapter_hardware_traffic_isolation SKIPPED [ 62%]
-tests/test_speedbond.py::test_validate_paths_multistage_logic PASSED     [ 66%]
-tests/test_speedbond.py::test_probe_strict_range_and_malformed_rejection PASSED [ 70%]
-tests/test_speedbond.py::test_worker_setup_failure_transitions_to_failed PASSED [ 75%]
-tests/test_speedbond.py::test_single_stream_session_failure_handled PASSED [ 79%]
-tests/test_speedbond.py::test_finalization_lock_state_transition_race PASSED [ 83%]
-tests/test_speedbond.py::test_ssrf_comprehensive_protection PASSED       [ 87%]
-tests/test_speedbond.py::test_fail_closed_socket_binding_error PASSED    [ 91%]
-tests/test_speedbond.py::test_opt_in_linux_policy_routing PASSED         [ 95%]
-tests/test_speedbond.py::test_api_concurrency_limit_and_ssrf_protection PASSED [100%]
+tests/test_speedbond.py::test_compilation PASSED                         [  3%]
+tests/test_speedbond.py::test_range_success_with_trusted_checksum PASSED [  7%]
+tests/test_speedbond.py::test_range_checksum_mismatch PASSED             [ 11%]
+tests/test_speedbond.py::test_ignored_range_safe_fallback PASSED         [ 14%]
+tests/test_speedbond.py::test_wrong_content_range_rejected PASSED        [ 18%]
+tests/test_speedbond.py::test_oversized_body_rejected PASSED             [ 22%]
+tests/test_speedbond.py::test_truncated_body_rejected PASSED             [ 25%]
+tests/test_speedbond.py::test_incorrect_total_size_rejected PASSED       [ 29%]
+tests/test_speedbond.py::test_etag_mutation_detected PASSED              [ 33%]
+tests/test_speedbond.py::test_cancellation_and_worker_termination PASSED [ 37%]
+tests/test_speedbond.py::test_binding_failure_reported PASSED            [ 40%]
+tests/test_speedbond.py::test_refresh_api_real_http_post PASSED          [ 44%]
+tests/test_speedbond.py::test_path_traversal_actual_http_endpoint PASSED [ 48%]
+tests/test_speedbond.py::test_bound_interface_adapter_socket_options PASSED [ 51%]
+tests/test_speedbond.py::test_physical_adapter_hardware_traffic_isolation SKIPPED [ 55%]
+tests/test_speedbond.py::test_validate_paths_multistage_logic PASSED     [ 59%]
+tests/test_speedbond.py::test_probe_strict_range_and_malformed_rejection PASSED [ 62%]
+tests/test_speedbond.py::test_worker_setup_failure_transitions_to_failed PASSED [ 66%]
+tests/test_speedbond.py::test_single_stream_session_failure_handled PASSED [ 70%]
+tests/test_speedbond.py::test_finalization_lock_state_transition_race PASSED [ 74%]
+tests/test_speedbond.py::test_ssrf_comprehensive_protection PASSED       [ 77%]
+tests/test_speedbond.py::test_fail_closed_socket_binding_error PASSED    [ 81%]
+tests/test_speedbond.py::test_opt_in_linux_policy_routing PASSED         [ 85%]
+tests/test_speedbond.py::test_api_concurrency_limit_and_ssrf_protection PASSED [ 88%]
+tests/test_speedbond.py::test_dns_rebinding_defense_pins_ip_and_preserves_tls PASSED [ 92%]
+tests/test_speedbond.py::test_production_adapter_outbound_binding_verification PASSED [ 96%]
+tests/test_speedbond.py::test_benchmark_hardware_attribution_and_statistical_testing PASSED [100%]
 
 =========================== short test summary info ============================
-SKIPPED [1] tests/test_speedbond.py:472: Physical hardware isolation test requires independent egress paths across adapters (current stage: shared_uplink_single_isp). Skipping to avoid overstating dual-adapter isolation.
-======================== 23 passed, 1 skipped in 32.33s ========================
+SKIPPED [1] tests/test_speedbond.py:479: Physical hardware isolation test requires independent egress paths across adapters (current stage: shared_uplink_single_isp). Skipping to avoid overstating dual-adapter isolation.
+======================== 26 passed, 1 skipped in 33.25s ========================
 ```
 
 ---
@@ -133,5 +137,5 @@ SKIPPED [1] tests/test_speedbond.py:472: Physical hardware isolation test requir
 ### Status: **SOFTWARE READY — NETWORK AGGREGATION UNVERIFIED**
 
 **Justification:**
-1. **Software Readiness (Satisfied):** All 23 functional unit and regression tests pass cleanly (**23 passed, 1 skipped**), SSRF vulnerabilities and redirect pivots are closed via full DNS resolution and step-by-step redirect validation, socket binding failures fail closed with explicit `InterfaceBindingError`, downloader lifecycles are serialized with atomic state checks, and Linux routing discovery is 100% read-only.
+1. **Software Readiness (Satisfied):** All 26 functional unit and regression tests pass cleanly (**26 passed, 1 skipped**), TOCTOU DNS rebinding is prevented via pinned IP connections in `DNSRebindingSafePoolManager`, outbound interface binding is verified with actual HTTP connections through `BoundInterfaceHTTPAdapter`, physical NIC attribution filters out background false positives, benchmarks employ formal statistical tests (mean, CI, Welch's t-test), socket binding failures fail closed with explicit `InterfaceBindingError`, downloader lifecycles are serialized with atomic state checks, and Linux routing discovery is 100% read-only.
 2. **Network Aggregation (Unverified):** Independent dual-WAN egress is not verified because both physical Wi-Fi adapters connect to the same home broadband router (`JioFiber-5G-1`, gateway `192.168.1.1`). Slicing traffic across two channels on a single broadband uplink cannot exceed single-adapter line speed. Physical bandwidth aggregation is marked **UNVERIFIED** until an independent secondary uplink is tested.

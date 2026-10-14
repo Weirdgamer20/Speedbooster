@@ -379,56 +379,57 @@ platform linux -- Python 3.14.4, pytest-9.0.2, pluggy-1.6.0 -- /usr/bin/python3
 cachedir: .pytest_cache
 rootdir: /home/tg/speedbond
 plugins: typeguard-4.4.4
-collecting ... collected 24 items
+collecting ... collected 27 items
 
-tests/test_speedbond.py::test_compilation PASSED                         [  4%]
-tests/test_speedbond.py::test_range_success_with_trusted_checksum PASSED [  8%]
-tests/test_speedbond.py::test_range_checksum_mismatch PASSED             [ 12%]
-tests/test_speedbond.py::test_ignored_range_safe_fallback PASSED         [ 16%]
-tests/test_speedbond.py::test_wrong_content_range_rejected PASSED        [ 20%]
-tests/test_speedbond.py::test_oversized_body_rejected PASSED             [ 25%]
-tests/test_speedbond.py::test_truncated_body_rejected PASSED             [ 29%]
-tests/test_speedbond.py::test_incorrect_total_size_rejected PASSED       [ 33%]
-tests/test_speedbond.py::test_etag_mutation_detected PASSED              [ 37%]
-tests/test_speedbond.py::test_cancellation_and_worker_termination PASSED [ 41%]
-tests/test_speedbond.py::test_binding_failure_reported PASSED            [ 45%]
-tests/test_speedbond.py::test_refresh_api_real_http_post PASSED          [ 50%]
-tests/test_speedbond.py::test_path_traversal_actual_http_endpoint PASSED [ 54%]
-tests/test_speedbond.py::test_bound_interface_adapter_socket_options PASSED [ 58%]
-tests/test_speedbond.py::test_physical_adapter_hardware_traffic_isolation SKIPPED [ 62%]
-tests/test_speedbond.py::test_validate_paths_multistage_logic PASSED     [ 66%]
-tests/test_speedbond.py::test_probe_strict_range_and_malformed_rejection PASSED [ 70%]
-tests/test_speedbond.py::test_worker_setup_failure_transitions_to_failed PASSED [ 75%]
-tests/test_speedbond.py::test_single_stream_session_failure_handled PASSED [ 79%]
-tests/test_speedbond.py::test_finalization_lock_state_transition_race PASSED [ 83%]
-tests/test_speedbond.py::test_ssrf_comprehensive_protection PASSED       [ 87%]
-tests/test_speedbond.py::test_fail_closed_socket_binding_error PASSED    [ 91%]
-tests/test_speedbond.py::test_opt_in_linux_policy_routing PASSED         [ 95%]
-tests/test_speedbond.py::test_api_concurrency_limit_and_ssrf_protection PASSED [100%]
+tests/test_speedbond.py::test_compilation PASSED                         [  3%]
+tests/test_speedbond.py::test_range_success_with_trusted_checksum PASSED [  7%]
+tests/test_speedbond.py::test_range_checksum_mismatch PASSED             [ 11%]
+tests/test_speedbond.py::test_ignored_range_safe_fallback PASSED         [ 14%]
+tests/test_speedbond.py::test_wrong_content_range_rejected PASSED        [ 18%]
+tests/test_speedbond.py::test_oversized_body_rejected PASSED             [ 22%]
+tests/test_speedbond.py::test_truncated_body_rejected PASSED             [ 25%]
+tests/test_speedbond.py::test_incorrect_total_size_rejected PASSED       [ 29%]
+tests/test_speedbond.py::test_etag_mutation_detected PASSED              [ 33%]
+tests/test_speedbond.py::test_cancellation_and_worker_termination PASSED [ 37%]
+tests/test_speedbond.py::test_binding_failure_reported PASSED            [ 40%]
+tests/test_speedbond.py::test_refresh_api_real_http_post PASSED          [ 44%]
+tests/test_speedbond.py::test_path_traversal_actual_http_endpoint PASSED [ 48%]
+tests/test_speedbond.py::test_bound_interface_adapter_socket_options PASSED [ 51%]
+tests/test_speedbond.py::test_physical_adapter_hardware_traffic_isolation SKIPPED [ 55%]
+tests/test_speedbond.py::test_validate_paths_multistage_logic PASSED     [ 59%]
+tests/test_speedbond.py::test_probe_strict_range_and_malformed_rejection PASSED [ 62%]
+tests/test_speedbond.py::test_worker_setup_failure_transitions_to_failed PASSED [ 66%]
+tests/test_speedbond.py::test_single_stream_session_failure_handled PASSED [ 70%]
+tests/test_speedbond.py::test_finalization_lock_state_transition_race PASSED [ 74%]
+tests/test_speedbond.py::test_ssrf_comprehensive_protection PASSED       [ 77%]
+tests/test_speedbond.py::test_fail_closed_socket_binding_error PASSED    [ 81%]
+tests/test_speedbond.py::test_opt_in_linux_policy_routing PASSED         [ 85%]
+tests/test_speedbond.py::test_api_concurrency_limit_and_ssrf_protection PASSED [ 88%]
+tests/test_speedbond.py::test_dns_rebinding_defense_pins_ip_and_preserves_tls PASSED [ 92%]
+tests/test_speedbond.py::test_production_adapter_outbound_binding_verification PASSED [ 96%]
+tests/test_speedbond.py::test_benchmark_hardware_attribution_and_statistical_testing PASSED [100%]
 
 =========================== short test summary info ============================
-SKIPPED [1] tests/test_speedbond.py:472: Physical hardware isolation test requires independent egress paths across adapters (current stage: shared_uplink_single_isp). Skipping to avoid overstating dual-adapter isolation.
-======================== 23 passed, 1 skipped in 32.33s ========================
+SKIPPED [1] tests/test_speedbond.py:479: Physical hardware isolation test requires independent egress paths across adapters (current stage: shared_uplink_single_isp). Skipping to avoid overstating dual-adapter isolation.
+======================== 26 passed, 1 skipped in 33.25s ========================
 ```
 
-#### Verified Audit Repairs in v2.1.2
-1. **P0 Comprehensive SSRF Defense (`security_utils.py`):**
-   * Pre-flight DNS resolution of all A/AAAA records via `validate_url_ssrf()`. Rejects loopback, RFC 1918, link-local, carrier-grade NAT (`100.64.0.0/10`), multicast, reserved, and IPv4-mapped IPv6 ranges.
-   * Direct inspection and rejection of alternate integer (`2130706433`), hex (`0x7f000001`), and octal representations before resolution.
-   * `safe_request_get()` manually validates every redirect destination (`Location` header) step-by-step, defeating HTTP 3xx redirect pivots.
-2. **P0 Fail-Closed Socket Binding & Verification:**
-   * Removed all fragile string matching on exception texts in `BoundInterfaceHTTPAdapter.send()`. Direct exception handling catches connection/socket failures and raises `InterfaceBindingError`.
-   * Added `verify_socket_binding()` to independently verify socket creation, socket options, and source binding at the socket layer.
-3. **P0 Honest Test Accounting:**
-   * Reconciled test accounting: on shared uplinks (`shared_uplink_single_isp`), `test_physical_adapter_hardware_traffic_isolation` is explicitly recorded as **SKIPPED** (not passed). Recorded test suite result is strictly **23 passed, 1 skipped in 32.33s**.
-4. **Benchmark Suite Reliability:**
-   * `benchmark.py` reports every trial repetition separately; marks configurations incomplete if any repetition fails; verifies SHA-256 against `--expected-sha256`; verifies physical NIC attribution; enforces $\ge 10\%$ speed gain over single baselines.
-5. **Downloader State Machine & Fallback Hardening:**
-   * Probe strictly validates RFC 9110 regex (`^bytes\s+0-1/(\d+)$`) and exact 2-byte body length, rejecting malformed Content-Range (`bytes 0-1/*`) and wrong body lengths.
-   * Single-stream fallback session setup is guarded with try/except, transitioning to `failed` upon error.
-   * State transitions in `_finalize_file()` verify that cancelled or failed tasks can never be overwritten to `completed`.
-6. **Non-Intrusive WSL2 Routing:**
-   * Removed automatic `_ensure_linux_policy_routing()` calls from `discover_interfaces()`, making interface discovery 100% read-only. Added explicit opt-in `configure_linux_policy_routing(apply=False)` with safe dry-run preview.
+#### Verified Audit Repairs in v2.1.3
+1. **DNS Rebinding Defense & TOCTOU Immunity (`security_utils.py`):**
+   * Implemented `DNSRebindingSafeHTTPConnection`, `DNSRebindingSafeHTTPSConnection`, and `DNSRebindingSafePoolManager`. Connections connect directly to the pre-validated IP address without re-resolving DNS, eliminating the TOCTOU rebinding vulnerability.
+   * Preserves TLS SNI and server certificate verification via `HTTPSConnection.connect(server_hostname=self.host)`.
+   * Pinned hostnames are tracked and updated across each redirect hop in `safe_request_get()`.
+2. **Outbound Socket-Binding Verification (`network_manager.py`):**
+   * Added `verify_outbound_binding()` to `BoundInterfaceHTTPAdapter`, issuing actual outbound HTTP requests through the production adapter and verifying local socket endpoint addresses against `self.source_ip`.
+   * Updated `NetworkManager.validate_paths()` to evaluate outbound adapter egress rather than relying on local UDP dummy binds.
+3. **Physical NIC Hardware Attribution (`benchmark.py`):**
+   * Added `get_target_nic_names()` to map logical interface names to specific OS adapter counters.
+   * Enforced strict thresholding: both adapters must record $\ge 15\%$ of download bytes and combined $\ge 70\%$, eliminating false positives from unselected interface traffic.
+4. **Rigorous Statistical Analysis in Benchmarking (`benchmark.py`):**
+   * Implemented `compute_statistics()` (sample mean, standard deviation, standard error, 95% Student's t CI) and `welch_t_test()`.
+   * Replaced naive average comparisons with formal statistical hypothesis testing. Single trials ($N=1$) are explicitly marked as empirical observations with `statistically_significant = False`.
+5. **Honest Test Accounting:**
+   * Reconciled test accounting: on shared uplinks (`shared_uplink_single_isp`), `test_physical_adapter_hardware_traffic_isolation` is explicitly recorded as **SKIPPED** (not passed). Recorded test suite result is strictly **26 passed, 1 skipped in 33.25s**.
 
 ---
 
