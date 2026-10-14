@@ -4,21 +4,30 @@
 **Author:** Senior Windows Networking & Software Quality Engineering  
 **Version:** 2.1.4  
 **Date:** 14 October 2026  
-**Overall Readiness Verdict:** **SOFTWARE READY — NETWORK AGGREGATION UNVERIFIED**  
+**Overall Readiness Verdict:** **SOURCE/CI CHECKS PASS — WINDOWS AND PHYSICAL AGGREGATION UNVERIFIED**  
 
 ---
+
+## Follow-up Audit — Repair Branch Status (14 October 2026)
+
+- **Base commit:** `4e5927d3db7e7a694b4e3a671244fc00e47e57f4`
+- **Repair branch:** `fix/latest-commit-audit`
+- **Validated source SHA:** `f1d2080abac2c2a45b8c38c49b2b16644ede0f8a`
+- **CI:** Python 3.11 and 3.12 both passed; each run reported **48 passed, 1 skipped**. `compileall` and Ruff undefined-name checks passed.
+- **Skip reason:** `test_physical_adapter_hardware_traffic_isolation` requires a physical two-uplink topology unavailable in hosted CI.
+- **Important remaining limitation:** These tests establish software behavior on Linux CI, not Windows/WSL2 driver-level interface binding or physical dual-WAN aggregation. The latter remains **UNVERIFIED** until tested with independent upstreams and live per-socket interface evidence.
 
 ## 1. Executive Summary
 
 SpeedBond is an application-level multi-WAN network aggregation system designed for Windows PCs equipped with two Wi-Fi adapters: an onboard **Intel Wi-Fi 6E AX211** adapter and an external **Realtek 8812BU 802.11ac USB Wi-Fi Dongle**.
 
-Following fourth-round source code audit review of commit `a16128d`, comprehensive repairs were implemented addressing fail-closed socket option handling, connection-time DNS rebinding defense, dual IPv4/IPv6 socket family support, live production connection telemetry inspection, explicit environment proxy policies, process-level task chunk attribution vs. background traffic, mathematically valid Welch's t-tests with Student's t distributions, and randomized repeated trial blocks with Holm-Bonferroni multiple-comparison correction.
+Historical v2.1.4 findings below describe the previous release audit. The follow-up audit began from commit `4e5927d` and is implemented on branch `fix/latest-commit-audit`. It fixed import blockers (`Union`, `Any`, and `random`), made SciPy an explicit benchmark dependency, removed approximate p-value fallback, corrected degenerate-sample handling, added paired block-level statistical comparisons with Holm correction, validated URL ports and pinned raw proxy/egress sockets to validated public IPs, hardened request-specific telemetry, and added API input/origin checks plus safer service binding. See the follow-up status below for the current branch's CI evidence.
 
-The automated test suite has been expanded to **35 deterministic tests**. The recorded suite execution in the target WSL2/Windows interop environment achieved:
+**Historical v2.1.4 target-environment test run (not the follow-up branch):** the recorded suite contained 35 tests and achieved:
 - **34 PASSED**
 - **1 SKIPPED** (`test_physical_adapter_hardware_traffic_isolation`, skipped because both adapters share the same upstream router and public IP)
 - **Total Duration:** 34.82s  
-- **Raw Log:** [`deliverables/logs/phase4_pytest_output.txt`](file:///C:/Users/thega/.gemini/antigravity-ide/scratch/speedbond/deliverables/logs/phase4_pytest_output.txt)
+- **Raw Log:** [`deliverables/logs/phase4_pytest_output.txt`](logs/phase4_pytest_output.txt)
 
 At the physical network layer, Windows diagnostic discovery established that both physical adapters connect to the **same home Wi-Fi access point (`JioFiber-5G-1`)**, share the **same default gateway (`192.168.1.1`)**, and egress through the **same public IP (`122.161.76.71`)**. Therefore, independent dual-WAN aggregation is physically blocked on this topology, and physical multi-WAN aggregation remains explicitly **UNVERIFIED**.
 
@@ -34,9 +43,9 @@ At the physical network layer, Windows diagnostic discovery established that bot
 | **Live Connection Telemetry & Outbound Verification** | **High** | `verify_outbound_binding()` checked local socket bind, but did not inspect actual production connection sockets or prove applied options. | **Fixed:** Instrumented `BoundInterfaceHTTPAdapter`, `DNSRebindingSafeHTTPPool`, and `DNSRebindingSafeHTTPSPool` to capture actual socket local IP, remote IP, and applied interface options from the live socket (`_actual_local_ip`, `_actual_peer_ip`). `verify_outbound_binding()` evaluates this live telemetry. Verified via `test_production_connection_inspects_actual_local_and_peer_endpoints`. |
 | **Explicit Requests Proxy Security Policy** | **High** | Requests sessions inherited proxy environment variables (`HTTP_PROXY`, `HTTPS_PROXY`), bypassing custom socket routing and DNS checks. | **Fixed:** Disabled automatic proxy inheritance (`session.trust_env = False`) across `safe_request_get()` and session creation. Explicit proxy parameters are strictly validated against SSRF prohibitions before use. Verified via `test_proxy_environment_variables_policy`. |
 | **Benchmark Hardware Attribution vs. Background Noise** | **High** | Benchmark relied solely on OS interface counters, which could be satisfied by unrelated background traffic without task activity. | **Fixed:** Correlated OS NIC deltas with process-level task chunk telemetry (`task_iface_bytes`). Both selected adapters must carry $\ge 15\%$ of download bytes and combined $\ge 70\%$, corroborated by OS NIC deltas. Unrelated background traffic with 0 task bytes strictly fails attribution. Verified via `test_background_traffic_cannot_pass_nic_attribution`. |
-| **Mathematically Valid Welch's t-test with SciPy** | **High** | Benchmark applied heuristic `t > 2` and rough lower-bound rules without calculating actual degrees of freedom or p-values. | **Fixed:** Integrated `scipy.stats.ttest_ind(..., equal_var=False, alternative='greater')` and `scipy.stats.t.ppf` (with full numerical fallback when SciPy is absent). Calculates real Welch-Satterthwaite df, exact p-value, and Student's t 95% CI. Never claims significance without calculated $p < 0.05$. Verified via `test_welch_t_test_against_scipy_reference`. |
+| **Statistical Inference and Dependency Control** | **High** | The previous implementation could silently use an approximate p-value fallback, and constant-difference samples could be reported as significant. | **Fixed in follow-up branch:** SciPy is declared in `requirements.txt`; benchmark import fails clearly if it is unavailable. Raw p-values retain full precision through Holm correction. Zero-variance degenerate samples are inconclusive. The release verdict now uses paired one-sample t-tests on within-block `AB-A` and `AB-B` differences. |
 | **Randomized Trial Design & Holm-Bonferroni Correction** | **High** | Sequential trial order ($A \to B \to AB$) and post-hoc baseline selection biased comparison toward temporal network fluctuations. | **Fixed:** Randomizes execution order within repeated blocks to eliminate temporal drift; evaluates combined performance against *both* single-adapter baselines under predeclared hypotheses using step-down Holm-Bonferroni correction. Single trials ($N=1$) are strictly labeled as descriptive only. Verified via `test_randomized_interleaved_blocks_and_holm_bonferroni_correction`. |
-| **Physical Isolation Test Accounting** | **P0** | Reports previously claimed all tests passed without highlighting that physical isolation test skips on shared uplinks. | **Fixed:** Reconciled test accounting across all deliverables. The recorded result is strictly **34 passed, 1 skipped**, transparently reporting the skip reason. |
+| **Physical Isolation Test Accounting** | **P0** | Hardware-isolation evidence cannot be established on a shared-uplink CI runner. | **Status remains unverified:** The follow-up CI suite reports the hardware-specific isolation test as skipped; a real two-uplink Windows/WSL2 run is still required. |
 
 ---
 
@@ -88,7 +97,7 @@ Tested against `python-3.12.0-amd64.exe` (26,507,904 raw bytes / 26.51 MB decima
 
 ## 5. Automated Acceptance Testing Results (23 Passed, 1 Skipped)
 
-Raw test log preserved at: [`deliverables/logs/phase4_pytest_output.txt`](file:///C:/Users/thega/.gemini/antigravity-ide/scratch/speedbond/deliverables/logs/phase4_pytest_output.txt)
+Historical raw test log: [`deliverables/logs/phase4_pytest_output.txt`](logs/phase4_pytest_output.txt)
 
 ```text
 ============================= test session starts ==============================
