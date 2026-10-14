@@ -18,6 +18,7 @@ import json
 import math
 import socket
 import argparse
+import random
 import subprocess
 from typing import Dict, List, Optional, Tuple, Set
 from network_manager import NetworkManager
@@ -65,9 +66,13 @@ def get_windows_nic_statistics() -> Dict[str, Dict[str, int]]:
 
 try:
     import scipy.stats
-    _HAS_SCIPY = True
-except ImportError:
-    _HAS_SCIPY = False
+except ImportError as exc:
+    raise RuntimeError(
+        "SciPy is required for benchmark statistical certification. "
+        "Install dependencies from requirements.txt before running benchmark.py."
+    ) from exc
+
+_HAS_SCIPY = True
 
 
 def get_target_nic_names(net_mgr: NetworkManager, ifnames: List[str]) -> Set[str]:
@@ -108,14 +113,7 @@ def compute_statistics(samples: List[float]) -> dict:
 
     if _HAS_SCIPY:
         t_crit = float(scipy.stats.t.ppf(0.975, df=df))
-    else:
-        t_table = {
-            1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571,
-            6: 2.447, 7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228,
-            15: 2.131, 20: 2.086, 30: 2.042, 60: 2.000, 120: 1.980
-        }
-        closest_df = min(t_table.keys(), key=lambda k: abs(k - df))
-        t_crit = t_table[closest_df] if df <= 120 else 1.96
+    t_crit = float(scipy.stats.t.ppf(0.975, df=df))
 
     margin = t_crit * stderr
 
@@ -147,9 +145,9 @@ def welch_t_test(samples_a: List[float], samples_b: List[float]) -> Tuple[float,
     var_b = sum((x - mean_b) ** 2 for x in samples_b) / (n_b - 1)
 
     if var_a == 0.0 and var_b == 0.0:
-        if mean_a == mean_b:
-            return 0.0, 0.5, float(n_a + n_b - 2), False
-        return (float('inf') if mean_a > mean_b else float('-inf')), (0.0 if mean_a > mean_b else 1.0), float(n_a + n_b - 2), (mean_a > mean_b)
+        # Welch's t statistic is undefined when both groups have zero variance.
+        # Different constant samples are not valid grounds for claiming p=0.
+        return 0.0, 1.0, 0.0, False
 
     if _HAS_SCIPY:
         res = scipy.stats.ttest_ind(samples_a, samples_b, equal_var=False, alternative="greater")
@@ -157,24 +155,11 @@ def welch_t_test(samples_a: List[float], samples_b: List[float]) -> Tuple[float,
         p_val = float(res.pvalue)
         df = float(res.df)
     else:
-        denom = math.sqrt((var_a / n_a) + (var_b / n_b))
-        if denom == 0.0:
-            return 0.0, 1.0, float(n_a + n_b - 2), False
-        t_stat = (mean_a - mean_b) / denom
-        term_a = var_a / n_a
-        term_b = var_b / n_b
-        num = (term_a + term_b) ** 2
-        den = ((term_a ** 2) / (n_a - 1)) + ((term_b ** 2) / (n_b - 1))
-        df = num / den if den > 0 else float(n_a + n_b - 2)
-        # Approximate one-tailed p-value
-        if t_stat <= 0:
-            p_val = 0.5 + 0.5 * (1.0 - math.exp(-0.717 * abs(t_stat) - 0.416 * (t_stat ** 2)))
-        else:
-            z = t_stat * (1.0 - 1.0 / (4.0 * df)) / math.sqrt(1.0 + t_stat ** 2 / (2.0 * df)) if df > 0 else t_stat
-            p_val = 0.5 * math.erfc(z / math.sqrt(2.0))
+        raise RuntimeError("SciPy is required for Welch's t-test.")
 
     is_significant = (p_val < 0.05) and (t_stat > 0)
-    return round(t_stat, 3), round(p_val, 4), round(df, 2), is_significant
+    # Preserve full precision for multiplicity correction; round only for display.
+    return float(t_stat), float(p_val), float(df), is_significant
 
 
 def run_single_trial_pass(trial_name: str, url: str, dest_path: str, net_mgr: NetworkManager, 
