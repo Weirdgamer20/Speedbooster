@@ -908,6 +908,20 @@ class NetworkManager:
                 f"Destination rejected by SSRF/DNS validation ({host}:{port}): {validation_error}"
             )
 
+        linux_device_binding_required = (
+            sys.platform.startswith("linux")
+            and ifname not in ["lo", "127.0.0.1", "loopback"]
+        )
+        if linux_device_binding_required and not hasattr(socket, "SO_BINDTODEVICE"):
+            raise InterfaceBindingError("SO_BINDTODEVICE is unavailable; refusing an unbound raw proxy connection.")
+        if not source_ip and not (
+            linux_device_binding_required
+            or (sys.platform == "win32" and if_index > 0)
+        ):
+            raise InterfaceBindingError(
+                f"No mandatory interface or source-address binding is available for adapter '{ifname}'."
+            )
+
         source_family = None
         if source_ip:
             source_family = socket.AF_INET6 if ipaddress.ip_address(source_ip).version == 6 else socket.AF_INET
