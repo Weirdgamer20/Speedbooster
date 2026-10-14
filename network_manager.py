@@ -765,55 +765,90 @@ class NetworkManager:
 
     def _test_interface_egress(self, ifname: str, source_ip: Optional[str] = None) -> Tuple[Optional[str], float]:
         """
-        Tests whether an interface can route to the internet.
-        Windows: binds by source IP address (the only supported method).
-        Linux: additionally applies SO_BINDTODEVICE for strict interface pinning.
+        Tests internet egress using a validated, pinned public IPv4 destination.
+        Rejects DNS answers containing prohibited ranges and validates the response as a public IP.
         Returns (public_ip, latency_ms), or (None, 0.0) on failure.
         """
         t0 = time.time()
+        sock = None
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            if source_ip and ipaddress.ip_address(source_ip).version != 4:
+                logger.warning("IPv6 source address is not supported by this IPv4 egress probe: %s", source_ip)
+                return None, 0.0
 
-            # Linux: SO_BINDTODEVICE pins the socket to a physical NIC
+            valid, validation_error, resolved_ips = validate_url_ssrf("http://api.ipify.org:80/", allow_local=False)
+            if not valid:
+                logger.warning("Egress probe destination validation failed: %s", validation_error)
+                return None, 0.0
+            # Socket is AF_INET, so pin a validated IPv4 result rather than allowing connect()
+            # to perform a second DNS lookup or choose an IPv6 address.
+            ipv4_targets = [ip for ip in resolved_ips if ipaddress.ip_address(ip).version == 4]
+            if not ipv4_targets:
+                logger.warning("Egress probe hostname returned no validated IPv4 address")
+                return None, 0.0
+            target_ip = ipv4_targets[0]
+
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             if sys.platform.startswith("linux") and hasattr(socket, "SO_BINDTODEVICE"):
                 if ifname and ifname not in ["lo", "127.0.0.1", "loopback"]:
-                    try:
-                        s.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_BINDTODEVICE", 25), ifname.encode() + b"\0")
-                    except Exception as be:
-                        s.close()
-                        logger.error("SO_BINDTODEVICE failed for '%s': %s (failing closed)", ifname, be)
-                        return None, 0.0
+                    sock.setsockopt(
+                        socket.SOL_SOCKET,
+                        getattr(socket, "SO_BINDTODEVICE", 25),
+                        ifname.encode() + b"\\0",
+                    )
 
-            # Windows & Linux: bind source IP so packets egress via the correct adapter
             if source_ip:
-                try:
-                    s.bind((source_ip, 0))
-                except Exception as be:
-                    s.close()
-                    logger.error("Source IP bind failed for '%s' (ip=%s): %s", ifname, source_ip, be)
-                    return None, 0.0
+                sock.bind((source_ip, 0))
 
-            s.settimeout(8.0)
-            s.connect(("api.ipify.org", 80))
+            sock.settimeout(8.0)
+            sock.connect((target_ip, 80))
             latency = (time.time() - t0) * 1000
-            s.sendall(b"GET / HTTP/1.1\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n")
-            buf = b""
-            while True:
-                c = s.recv(512)
-                if not c:
+            sock.sendall(b"GET / HTTP/1.1\\r\\nHost: api.ipify.org\\r\\nConnection: close\\r\\n\\r\\n")
+
+            buf = bytearray()
+            while len(buf) <= 8192:
+                chunk = sock.recv(min(512, 8193 - len(buf)))
+                if not chunk:
                     break
-                buf += c
-            s.close()
-            parts = buf.split(b"\r\n\r\n")
-            if len(parts) > 1:
-                pub_ip = parts[-1].decode("ascii", errors="ignore").strip()
-                if pub_ip:
-                    logger.info("Egress verified: iface='%s' source='%s' public_ip='%s' latency=%.1fms",
-                                ifname, source_ip, pub_ip, latency)
-                    return pub_ip, latency
+                buf.extend(chunk)
+            if len(buf) > 8192:
+                logger.warning("Egress probe response exceeded the 8 KiB limit")
+                return None, 0.0
+
+            header_body = bytes(buf).split(b"\\r\\n\\r\\n", 1)
+            if len(header_body) != 2:
+                logger.warning("Egress probe response did not contain a valid HTTP header/body boundary")
+                return None, 0.0
+            status_line = header_body[0].split(b"\\r\\n", 1)[0]
+            if not status_line.startswith(b"HTTP/") or b" 200 " not in status_line:
+                logger.warning("Egress probe returned unexpected HTTP status: %r", status_line)
+                return None, 0.0
+
+            body = header_body[1].decode("ascii", errors="strict").strip()
+            try:
+                public_ip = ipaddress.ip_address(body)
+            except ValueError:
+                logger.warning("Egress probe returned a non-IP body: %r", body[:100])
+                return None, 0.0
+            if not public_ip.is_global or is_prohibited_ip(public_ip):
+                logger.warning("Egress probe returned a non-public address: %s", public_ip)
+                return None, 0.0
+
+            result_ip = str(public_ip)
+            logger.info(
+                "Egress verified: iface='%s' source='%s' public_ip='%s' pinned_peer='%s' latency=%.1fms",
+                ifname, source_ip, result_ip, target_ip, latency
+            )
+            return result_ip, latency
         except Exception as e:
             logger.info("Egress test failed for '%s' (ip=%s): %s", ifname, source_ip, e)
-        return None, 0.0
+            return None, 0.0
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
 
     def create_requests_session(self, ifname: str) -> requests.Session:
         """Creates a requests.Session whose sockets are bound strictly to `ifname`."""
