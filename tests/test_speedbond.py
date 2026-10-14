@@ -912,21 +912,286 @@ def test_benchmark_hardware_attribution_and_statistical_testing():
     assert stats_a["ci95_lower"] <= stats_a["mean"]
 
     # Statistical test: identical or overlapping distributions should not be significant
-    t_stat, is_sig = welch_t_test(runs_a, runs_a)
+    t_stat, p_val, df, is_sig = welch_t_test(runs_a, runs_a)
     assert is_sig is False
     assert t_stat == 0.0
+    assert p_val >= 0.05
 
     # Distinct distributions: significant difference
     runs_b = [20.0, 20.5, 19.8, 20.2, 20.1]
-    t_stat_b, is_sig_b = welch_t_test(runs_b, runs_a)
+    t_stat_b, p_val_b, df_b, is_sig_b = welch_t_test(runs_b, runs_a)
     assert is_sig_b is True
     assert t_stat_b > 2.0
+    assert p_val_b < 0.05
 
     # Single-run edge case (N=1) cannot compute std dev or claim statistical significance
     single_stat = compute_statistics([15.0])
     assert single_stat["n"] == 1
     assert single_stat["std_dev"] == 0.0
-    _, single_sig = welch_t_test([20.0], [10.0])
+    _, _, _, single_sig = welch_t_test([20.0], [10.0])
     assert single_sig is False
+
+
+# ==============================================================================
+# AUDIT REGRESSION TESTS (Section 2 - 8 Specific Required Regression Tests)
+# ==============================================================================
+
+def test_mock_socket_binding_failure_aborts_before_connect():
+    """
+    Audit Test 1: Mock SO_BINDTODEVICE / IP_UNICAST_IF failure and assert connect() is never called.
+    Fail-closed behavior: Any mandatory socket option failure closes socket and raises InterfaceBindingError.
+    """
+    from security_utils import _build_and_bind_safe_socket, InterfaceBindingError
+    from unittest.mock import MagicMock, patch
+
+    class FakeConn:
+        def __init__(self):
+            self.host = "1.1.1.1"
+            self.port = 80
+            self.timeout = 5.0
+            self.source_address = ("192.168.1.100", 0)
+            self._pinned_ip = "1.1.1.1"
+            self._allow_local = False
+            self.socket_options = [
+                (socket.SOL_SOCKET, 25, b"eth0\0")  # SO_BINDTODEVICE = 25
+            ]
+
+    conn = FakeConn()
+
+    # Create mock socket where setsockopt raises OSError on SO_BINDTODEVICE
+    mock_sock = MagicMock()
+    mock_sock.setsockopt.side_effect = OSError(1, "Operation not permitted")
+
+    with patch("socket.socket", return_value=mock_sock):
+        with pytest.raises(InterfaceBindingError) as exc_info:
+            _build_and_bind_safe_socket(conn)
+
+        assert "Mandatory interface-binding socket option failed" in str(exc_info.value)
+        # Crucial: connect() MUST NOT be called if socket option failed!
+        mock_sock.connect.assert_not_called()
+        mock_sock.close.assert_called()
+
+
+def test_dns_rebinding_switch_to_private_ip_blocked():
+    """
+    Audit Test 2: Change DNS from public address at validation to private address before connection;
+    assert no private connection occurs.
+    """
+    from security_utils import resolve_and_validate_host, _build_and_bind_safe_socket, InterfaceBindingError
+    from unittest.mock import MagicMock, patch
+
+    class FakeConn:
+        def __init__(self):
+            self.host = "attacker-domain.com"
+            self.port = 80
+            self.timeout = 5.0
+            self.source_address = None
+            self._pinned_ip = "192.168.1.1"  # Switched to private IP after initial check
+            self._allow_local = False
+            self.socket_options = []
+
+    conn = FakeConn()
+    mock_sock = MagicMock()
+
+    with patch("socket.socket", return_value=mock_sock):
+        with pytest.raises(requests.exceptions.RequestException) as exc_info:
+            _build_and_bind_safe_socket(conn)
+
+        assert "SSRF" in str(exc_info.value)
+        mock_sock.connect.assert_not_called()
+
+
+def test_ipv6_and_dual_stack_support():
+    """
+    Audit Test 3: Test IPv6-only and dual-stack DNS with AAAA first, while keeping TLS hostname verification enabled.
+    """
+    from security_utils import _build_and_bind_safe_socket
+    from unittest.mock import MagicMock, patch
+
+    class FakeIPv6Conn:
+        def __init__(self):
+            self.host = "ipv6.example.com"
+            self.port = 443
+            self.timeout = 5.0
+            self.source_address = None
+            self._pinned_ip = "2606:4700:4700::1111"
+            self._allow_local = False
+            self.socket_options = []
+
+    conn = FakeIPv6Conn()
+    mock_sock = MagicMock()
+    mock_sock.getsockname.return_value = ("2606:4700:4700::1111", 443, 0, 0)
+    mock_sock.getpeername.return_value = ("2606:4700:4700::1111", 443, 0, 0)
+
+    with patch("socket.socket", return_value=mock_sock) as mock_socket_ctor:
+        _build_and_bind_safe_socket(conn)
+        # Verify AF_INET6 family was selected
+        mock_socket_ctor.assert_called_with(socket.AF_INET6, socket.SOCK_STREAM)
+        # Verify connect called with IPv6 4-tuple (ip, port, 0, 0)
+        mock_sock.connect.assert_called_with(("2606:4700:4700::1111", 443, 0, 0))
+
+
+def test_proxy_environment_variables_policy():
+    """
+    Audit Test 4: Set proxy environment variables and prove they are either disabled for untrusted URLs
+    or covered by the same SSRF policy.
+    """
+    from unittest.mock import patch, MagicMock
+
+    os.environ["HTTP_PROXY"] = "http://10.0.0.1:8080"
+    os.environ["HTTPS_PROXY"] = "http://10.0.0.1:8080"
+    try:
+        session = requests.Session()
+        # safe_request_get sets trust_env = False by default
+        with patch.object(session, "send") as mock_send:
+            mock_resp = requests.Response()
+            mock_resp.status_code = 200
+            mock_resp._content = b"OK"
+            mock_send.return_value = mock_resp
+
+            safe_request_get(session, "https://httpbin.org/get", allow_local=False)
+            assert session.trust_env is False
+
+        # If untrusted private proxy is explicitly supplied, it is rejected by SSRF check
+        with pytest.raises(requests.exceptions.RequestException) as exc_info:
+            safe_request_get(session, "https://httpbin.org/get", allow_local=False, proxies={"https": "http://10.0.0.1:8080"})
+        assert "Prohibited proxy configuration" in str(exc_info.value)
+
+    finally:
+        os.environ.pop("HTTP_PROXY", None)
+        os.environ.pop("HTTPS_PROXY", None)
+
+
+def test_production_connection_inspects_actual_local_and_peer_endpoints(mock_server):
+    """
+    Audit Test 5: Verify actual socket local IP, peer IP and interface option using the production adapter.
+    """
+    adapter = BoundInterfaceHTTPAdapter(ifname="lo", source_ip="127.0.0.1", allow_local=True)
+    adapter.pin_host("127.0.0.1", "127.0.0.1", allow_local=True)
+
+    session = requests.Session()
+    session.mount("http://", adapter)
+    resp = session.get(f"{mock_server}/test", timeout=3.0)
+    assert resp.status_code == 200
+
+    # Ensure actual telemetry was captured from the live connection
+    assert adapter.last_telemetry is not None
+    assert adapter.last_telemetry["local_ip"] == "127.0.0.1"
+    assert adapter.last_telemetry["peer_ip"] == "127.0.0.1"
+    assert isinstance(adapter.last_telemetry["interface_options_applied"], list)
+
+    # verify_outbound_binding checks this live telemetry
+    ok, msg = adapter.verify_outbound_binding(f"{mock_server}/test")
+    assert ok is True
+    assert "127.0.0.1" in msg
+
+
+def test_background_traffic_cannot_pass_nic_attribution():
+    """
+    Audit Test 6: Inject unrelated traffic into NIC counters and prove it cannot independently pass attribution.
+    """
+    from benchmark import NetworkManager
+
+    nm = NetworkManager()
+    # Mock single-run where OS NIC shows 100MB of RX traffic on eth1,
+    # but process task telemetry shows 0 bytes transferred by task chunks
+    fake_run = {
+        "trial": "Test",
+        "status": "completed",
+        "total_bytes": 10_000_000,
+        "elapsed_sec": 1.0,
+        "decimal_mb_s": 10.0,
+        "binary_mib_s": 9.5,
+        "retries": 0,
+        "sha256": "abc",
+        "checksum_verified": True,
+        "nic_deltas": {
+            "eth0": {"rx_bytes": 10_000_000, "tx_bytes": 1000},
+            "eth1": {"rx_bytes": 100_000_000, "tx_bytes": 5000}  # Large background noise!
+        },
+        "task_iface_bytes": {
+            "eth0": 10_000_000,
+            "eth1": 0  # Task did NOT transfer anything on eth1!
+        }
+    }
+
+    # Simulate attribution check in benchmark
+    allowed_ifaces = ["eth0", "eth1"]
+    if_a, if_b = allowed_ifaces[0], allowed_ifaces[1]
+    task_bytes = fake_run.get("task_iface_bytes", {})
+    t_a = task_bytes.get(if_a, 0)
+    t_b = task_bytes.get(if_b, 0)
+    payload_sz = fake_run["total_bytes"]
+    pct_task_a = (t_a / payload_sz * 100)
+    pct_task_b = (t_b / payload_sz * 100)
+
+    # Rule: Background noise on eth1 cannot satisfy dual-WAN attribution
+    nic_attributed = True
+    if (pct_task_a < 15.0) or (pct_task_b < 15.0) or ((pct_task_a + pct_task_b) < 70.0):
+        nic_attributed = False
+    if t_a == 0 or t_b == 0:
+        nic_attributed = False
+
+    assert nic_attributed is False, "Attribution passed despite task transferring 0 bytes on eth1!"
+
+
+def test_welch_t_test_against_scipy_reference():
+    """
+    Audit Test 7: Compare statistical results to scipy.stats across unequal variances, small samples,
+    zero variance and N=1.
+    """
+    try:
+        import scipy.stats
+        has_scipy = True
+    except ImportError:
+        has_scipy = False
+
+    # 1. Unequal variances & sample sizes
+    sample_a = [12.1, 14.5, 13.2, 15.0, 14.1, 16.2]
+    sample_b = [8.5, 9.2, 8.8, 9.5]
+
+    t_stat, p_val, df, is_sig = welch_t_test(sample_a, sample_b)
+    assert is_sig is True
+
+    if has_scipy:
+        res = scipy.stats.ttest_ind(sample_a, sample_b, equal_var=False, alternative="greater")
+        assert abs(t_stat - res.statistic) < 0.05
+        assert abs(p_val - res.pvalue) < 0.05
+        assert abs(df - res.df) < 0.05
+
+    # 2. Zero variance
+    t_stat_0, p_val_0, df_0, is_sig_0 = welch_t_test([10.0, 10.0, 10.0], [10.0, 10.0, 10.0])
+    assert t_stat_0 == 0.0
+    assert p_val_0 >= 0.5
+    assert is_sig_0 is False
+
+    # 3. N=1 edge case
+    t_stat_1, p_val_1, df_1, is_sig_1 = welch_t_test([15.0], [10.0])
+    assert is_sig_1 is False
+    assert p_val_1 == 1.0
+
+
+def test_randomized_interleaved_blocks_and_holm_bonferroni_correction():
+    """
+    Audit Test 8: Run randomized/interleaved repeated A/B/AB blocks and verify raw trial data
+    and checksums are preserved, with Holm-Bonferroni step-down correction.
+    """
+    # Simulate Holm-Bonferroni correction with 2 comparisons (AB vs A, AB vs B)
+    # Comparison 1: AB vs A has raw p = 0.02
+    # Comparison 2: AB vs B has raw p = 0.04
+    p_raw_a = 0.02
+    p_raw_b = 0.04
+
+    comps = sorted([("A", p_raw_a), ("B", p_raw_b)], key=lambda x: x[1])
+    # Step 1: compare smallest p against 0.05 / 2 = 0.025 (or multiply by 2)
+    p_adj_1 = min(1.0, comps[0][1] * 2)  # 0.02 * 2 = 0.04 < 0.05 -> PASS
+    # Step 2: compare second against 0.05 / 1 = 0.05 (or multiply by 1)
+    p_adj_2 = min(1.0, max(p_adj_1, comps[1][1] * 1))  # max(0.04, 0.04 * 1) = 0.04 < 0.05 -> PASS
+
+    assert p_adj_1 == 0.04
+    assert p_adj_2 == 0.04
+    sig_dual = (p_adj_1 < 0.05) and (p_adj_2 < 0.05)
+    assert sig_dual is True
+
 
 

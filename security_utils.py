@@ -15,8 +15,13 @@ from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
 from urllib3.poolmanager import PoolManager
 
 
-def is_prohibited_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+def is_prohibited_ip(ip: Union[str, ipaddress.IPv4Address, ipaddress.IPv6Address]) -> bool:
     """Checks whether an IP address belongs to private, loopback, link-local, multicast, or reserved ranges."""
+    if isinstance(ip, str):
+        try:
+            ip = ipaddress.ip_address(ip)
+        except ValueError:
+            return True
     if (
         ip.is_loopback
         or ip.is_private
@@ -129,6 +134,15 @@ def validate_url_ssrf(url: str, allow_local: bool = False) -> Tuple[bool, str, L
     return True, "", resolved_ips
 
 
+import logging
+logger = logging.getLogger("speedbond.security")
+
+
+class InterfaceBindingError(requests.exceptions.RequestException):
+    """Raised when an interface socket binding or connection cannot be fulfilled."""
+    pass
+
+
 def resolve_and_validate_host(host: str, port: int = 80, allow_local: bool = False) -> str:
     """
     Resolves hostname and verifies that no returned A/AAAA record targets prohibited network spaces.
@@ -145,63 +159,166 @@ def resolve_and_validate_host(host: str, port: int = 80, allow_local: bool = Fal
     return resolved_ips[0]
 
 
+def _build_and_bind_safe_socket(conn_instance) -> socket.socket:
+    """
+    Builds, configures, and connects an AF_INET or AF_INET6 socket to the validated destination IP.
+    Enforces fail-closed semantics: mandatory interface options (SO_BINDTODEVICE, IP_UNICAST_IF)
+    and source-address binding must succeed, or the socket is closed and InterfaceBindingError is raised
+    before connect() is attempted.
+    """
+    target_ip = getattr(conn_instance, "_pinned_ip", None)
+    allow_local = getattr(conn_instance, "_allow_local", False)
+    if not target_ip:
+        target_ip = resolve_and_validate_host(conn_instance.host, conn_instance.port, allow_local=allow_local)
+    elif not allow_local and is_prohibited_ip(target_ip):
+        raise requests.exceptions.RequestException(
+            f"SSRF violation: destination IP {target_ip} is in prohibited address space"
+        )
+
+    ip_obj = ipaddress.ip_address(target_ip)
+    if ip_obj.version == 6:
+        family = socket.AF_INET6
+        sockaddr = (target_ip, conn_instance.port, 0, 0)
+    else:
+        family = socket.AF_INET
+        sockaddr = (target_ip, conn_instance.port)
+
+    s = socket.socket(family, socket.SOCK_STREAM)
+    applied_mandatory_opts = []
+
+    SO_BINDTODEVICE = getattr(socket, "SO_BINDTODEVICE", 25)
+    IP_UNICAST_IF = getattr(socket, "IP_UNICAST_IF", 31)
+
+    for opt in conn_instance.socket_options:
+        level, optname, val = opt[0], opt[1], opt[2]
+        is_mandatory = (optname == SO_BINDTODEVICE or optname == IP_UNICAST_IF)
+        try:
+            s.setsockopt(*opt)
+            if is_mandatory:
+                applied_mandatory_opts.append(optname)
+        except Exception as e:
+            if is_mandatory:
+                s.close()
+                raise InterfaceBindingError(
+                    f"Mandatory interface-binding socket option failed ({optname}): {e}"
+                ) from e
+            # Optional socket options (e.g. TCP_NODELAY) are non-fatal
+            logger.debug("Optional socket option (%d) failed: %s", optname, e)
+
+    if conn_instance.source_address:
+        src_ip_str = conn_instance.source_address[0]
+        src_port = conn_instance.source_address[1] if len(conn_instance.source_address) > 1 else 0
+        if src_ip_str:
+            try:
+                src_ip_obj = ipaddress.ip_address(src_ip_str)
+                if src_ip_obj.version != ip_obj.version:
+                    s.close()
+                    raise InterfaceBindingError(
+                        f"Mandatory source-address binding family mismatch: source {src_ip_str} "
+                        f"(IPv{src_ip_obj.version}) vs destination {target_ip} (IPv{ip_obj.version})"
+                    )
+                if ip_obj.version == 6:
+                    s.bind((src_ip_str, src_port, 0, 0))
+                else:
+                    s.bind((src_ip_str, src_port))
+                applied_mandatory_opts.append("source_address")
+            except Exception as e:
+                s.close()
+                if isinstance(e, InterfaceBindingError):
+                    raise
+                raise InterfaceBindingError(
+                    f"Mandatory source-address binding failed on {conn_instance.source_address}: {e}"
+                ) from e
+
+    s.settimeout(conn_instance.timeout)
+    try:
+        s.connect(sockaddr)
+    except Exception as e:
+        s.close()
+        raise InterfaceBindingError(
+            f"Failed to connect to destination {sockaddr}: {e}"
+        ) from e
+
+    # Record actual telemetry on connection instance
+    try:
+        sock_name = s.getsockname()
+        if sock_name and len(sock_name) >= 2:
+            conn_instance._actual_local_ip, conn_instance._actual_local_port = sock_name[0], sock_name[1]
+        else:
+            conn_instance._actual_local_ip, conn_instance._actual_local_port = None, None
+    except Exception:
+        conn_instance._actual_local_ip, conn_instance._actual_local_port = None, None
+
+    try:
+        peer_name = s.getpeername()
+        if peer_name and len(peer_name) >= 2:
+            conn_instance._actual_peer_ip, conn_instance._actual_peer_port = peer_name[0], peer_name[1]
+        else:
+            conn_instance._actual_peer_ip, conn_instance._actual_peer_port = None, None
+    except Exception:
+        conn_instance._actual_peer_ip, conn_instance._actual_peer_port = None, None
+
+    conn_instance._interface_options_applied = applied_mandatory_opts
+    conn_instance._actual_socket = s
+
+    # Propagate telemetry to pool and adapter
+    pool = getattr(conn_instance, "_pool", None)
+    if pool is not None:
+        telem = {
+            "local_ip": conn_instance._actual_local_ip,
+            "local_port": conn_instance._actual_local_port,
+            "peer_ip": conn_instance._actual_peer_ip,
+            "peer_port": conn_instance._actual_peer_port,
+            "options": conn_instance._interface_options_applied,
+            "interface_options_applied": conn_instance._interface_options_applied,
+        }
+        pool.last_telemetry = telem
+        adapter = getattr(pool, "_adapter", None)
+        if adapter is not None:
+            adapter.last_telemetry = telem
+
+    return s
+
+
 class DNSRebindingSafeHTTPConnection(HTTPConnection):
     """
-    HTTPConnection that binds directly to a pre-validated IP address,
+    HTTPConnection that binds directly to a pre-validated IP address (IPv4 or IPv6),
     preventing secondary DNS resolution and TOCTOU DNS rebinding.
     """
     def _new_conn(self) -> socket.socket:
-        target_ip = getattr(self, "_pinned_ip", None)
-        allow_local = getattr(self, "_allow_local", False)
-        if not target_ip:
-            target_ip = resolve_and_validate_host(self.host, self.port, allow_local=allow_local)
-
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        for opt in self.socket_options:
-            try:
-                s.setsockopt(*opt)
-            except Exception:
-                pass
-        if self.source_address:
-            s.bind(self.source_address)
-
-        s.settimeout(self.timeout)
-        s.connect((target_ip, self.port))
-        return s
+        return _build_and_bind_safe_socket(self)
 
 
 class DNSRebindingSafeHTTPSConnection(HTTPSConnection):
     """
-    HTTPSConnection that binds directly to a pre-validated IP address,
-    guaranteeing that destination IP is one of the validated addresses
-    while preserving TLS SNI and server certificate hostname verification.
+    HTTPSConnection that binds directly to a pre-validated IP address (IPv4 or IPv6),
+    guaranteeing destination IP is pre-validated while preserving TLS SNI and server
+    certificate hostname verification.
     """
     def _new_conn(self) -> socket.socket:
-        target_ip = getattr(self, "_pinned_ip", None)
-        allow_local = getattr(self, "_allow_local", False)
-        if not target_ip:
-            target_ip = resolve_and_validate_host(self.host, self.port, allow_local=allow_local)
-
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        for opt in self.socket_options:
-            try:
-                s.setsockopt(*opt)
-            except Exception:
-                pass
-        if self.source_address:
-            s.bind(self.source_address)
-
-        s.settimeout(self.timeout)
-        s.connect((target_ip, self.port))
-        return s
+        return _build_and_bind_safe_socket(self)
 
 
 class DNSRebindingSafeHTTPPool(HTTPConnectionPool):
     ConnectionCls = DNSRebindingSafeHTTPConnection
 
+    def _new_conn(self):
+        conn = super()._new_conn()
+        conn._pinned_ip = getattr(self, "_pinned_ip", None)
+        conn._allow_local = getattr(self, "_allow_local", False)
+        conn._pool = self
+        return conn
+
 
 class DNSRebindingSafeHTTPSPool(HTTPSConnectionPool):
     ConnectionCls = DNSRebindingSafeHTTPSConnection
+
+    def _new_conn(self):
+        conn = super()._new_conn()
+        conn._pinned_ip = getattr(self, "_pinned_ip", None)
+        conn._allow_local = getattr(self, "_allow_local", False)
+        conn._pool = self
+        return conn
 
 
 class DNSRebindingSafePoolManager(PoolManager):
@@ -211,12 +328,45 @@ class DNSRebindingSafePoolManager(PoolManager):
         "https": DNSRebindingSafeHTTPSPool
     }
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.pool_classes_by_scheme = {
+            "http": DNSRebindingSafeHTTPPool,
+            "https": DNSRebindingSafeHTTPSPool
+        }
 
-def safe_request_get(session: requests.Session, url: str, allow_local: bool = False, max_redirects: int = 5, **kwargs) -> requests.Response:
+    def _new_pool(self, scheme, host, port, request_context=None):
+        pool = super()._new_pool(scheme, host, port, request_context=request_context)
+        pool._adapter = getattr(self, "_adapter", None)
+        return pool
+
+
+def safe_request_get(
+    session: requests.Session,
+    url: str,
+    allow_local: bool = False,
+    max_redirects: int = 5,
+    trust_env: bool = False,
+    **kwargs
+) -> requests.Response:
     """
     Issues a GET request with strict step-by-step SSRF validation and DNS pinning across all redirect hops.
     Guarantees destination IP is one of the validated addresses, preventing DNS rebinding pivots.
+    Disables environment proxy inheritance (trust_env=False) by default to prevent proxy hijacking.
     """
+    # Enforce safe proxy policy: disable unverified environment proxy inheritance
+    session.trust_env = trust_env
+
+    # If explicit proxies are supplied in kwargs or session, validate proxy destination against SSRF
+    proxies = kwargs.get("proxies") or session.proxies or {}
+    for scheme, proxy_url in proxies.items():
+        if proxy_url:
+            p_valid, p_err, _ = validate_url_ssrf(proxy_url, allow_local=False)
+            if not p_valid:
+                raise requests.exceptions.RequestException(
+                    f"SSRF violation: Prohibited proxy configuration for {scheme} ({proxy_url}): {p_err}"
+                )
+
     current_url = url
     for hop in range(max_redirects + 1):
         is_valid, err_msg, resolved_ips = validate_url_ssrf(current_url, allow_local=allow_local)

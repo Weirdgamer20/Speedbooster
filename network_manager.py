@@ -191,7 +191,16 @@ class BoundInterfaceHTTPAdapter(HTTPAdapter):
         self.if_index = if_index
         self.allow_local = allow_local
         self.pinned_hosts: Dict[str, str] = {}
+        self._last_telemetry: Optional[dict] = None
         super().__init__(*args, **kwargs)
+
+    @property
+    def last_telemetry(self) -> Optional[dict]:
+        return getattr(self, "_last_telemetry", None)
+
+    @last_telemetry.setter
+    def last_telemetry(self, val):
+        self._last_telemetry = val
 
     def pin_host(self, host: str, ip: str, allow_local: Optional[bool] = None):
         """Pins a hostname to a validated destination IP address, eliminating TOCTOU DNS rebinding."""
@@ -233,12 +242,14 @@ class BoundInterfaceHTTPAdapter(HTTPAdapter):
         self.poolmanager = DNSRebindingSafePoolManager(
             num_pools=connections, maxsize=maxsize, block=block, **pool_kwargs
         )
+        self.poolmanager._adapter = self
 
     def get_connection_with_tls_context(self, request, verify, proxies=None, cert=None):
         conn = super().get_connection_with_tls_context(request, verify, proxies=proxies, cert=cert)
         import urllib.parse
         host = (urllib.parse.urlparse(request.url).hostname or "").lower()
         conn._allow_local = self.allow_local
+        conn._adapter = self
         if host in self.pinned_hosts:
             conn._pinned_ip = self.pinned_hosts[host]
         return conn
@@ -248,6 +259,7 @@ class BoundInterfaceHTTPAdapter(HTTPAdapter):
         import urllib.parse
         host = (urllib.parse.urlparse(url).hostname or "").lower()
         conn._allow_local = self.allow_local
+        conn._adapter = self
         if host in self.pinned_hosts:
             conn._pinned_ip = self.pinned_hosts[host]
         return conn
@@ -282,7 +294,7 @@ class BoundInterfaceHTTPAdapter(HTTPAdapter):
     def verify_outbound_binding(self, test_url: Optional[str] = None) -> Tuple[bool, str]:
         """
         Tests an actual outbound connection through this production HTTP adapter and verifies
-        that the connection succeeds, socket options are applied, and the socket's bound
+        that the connection succeeds, mandatory interface options are applied, and the socket's bound
         local endpoint matches self.source_ip.
         """
         ok, err = self.verify_socket_binding()
@@ -292,21 +304,54 @@ class BoundInterfaceHTTPAdapter(HTTPAdapter):
         if test_url:
             try:
                 s = requests.Session()
+                s.trust_env = False
                 s.mount("http://", self)
                 s.mount("https://", self)
-                resp = s.get(test_url, timeout=3.0)
-                if resp.status_code >= 500:
-                    return False, f"Outbound probe returned server error {resp.status_code}"
-                return True, f"Verified outbound connection through adapter '{self.ifname}' (source: {self.source_ip})"
+                resp = s.get(test_url, timeout=4.0)
+                if resp.status_code >= 400:
+                    return False, f"Outbound probe returned error HTTP {resp.status_code}"
+
+                # Verify actual socket telemetry from production connection
+                telem = self.last_telemetry or {}
+                actual_local_ip = telem.get("local_ip")
+                actual_peer_ip = telem.get("peer_ip")
+                applied_options = telem.get("options", [])
+
+                if self.source_ip and actual_local_ip and actual_local_ip != self.source_ip:
+                    return False, (
+                        f"Outbound connection local IP mismatch on '{self.ifname}': "
+                        f"expected {self.source_ip}, got actual {actual_local_ip}"
+                    )
+
+                return True, (
+                    f"Verified outbound connection through adapter '{self.ifname}' "
+                    f"(local: {actual_local_ip or self.source_ip}, peer: {actual_peer_ip}, options: {applied_options})"
+                )
             except Exception as e:
                 return False, f"Outbound connection failed through adapter '{self.ifname}': {e}"
 
-        return True, f"Verified socket options and local address binding for '{self.ifname}' (IP: {self.source_ip})"
+        return True, f"Local socket options and address binding verified for '{self.ifname}' (outbound probe unperformed)"
 
     def send(self, request, **kwargs):
-        """Wraps send to ensure socket-level interface or source-address binding failures fail closed."""
+        """Wraps send to ensure socket-level interface or source-address binding failures fail closed and captures connection telemetry."""
         try:
-            return super().send(request, **kwargs)
+            resp = super().send(request, **kwargs)
+            # Inspect underlying pool or connection for telemetry if not already populated
+            if not self.last_telemetry:
+                conn = getattr(resp.raw, "_connection", None)
+                if conn:
+                    if hasattr(conn, "last_telemetry") and conn.last_telemetry:
+                        self.last_telemetry = conn.last_telemetry
+                    elif hasattr(conn, "_actual_local_ip"):
+                        self.last_telemetry = {
+                            "local_ip": getattr(conn, "_actual_local_ip", None),
+                            "local_port": getattr(conn, "_actual_local_port", None),
+                            "peer_ip": getattr(conn, "_actual_peer_ip", None),
+                            "peer_port": getattr(conn, "_actual_peer_port", None),
+                            "options": getattr(conn, "_interface_options_applied", []),
+                            "interface_options_applied": getattr(conn, "_interface_options_applied", []),
+                        }
+            return resp
         except InterfaceBindingError:
             raise
         except (requests.exceptions.ConnectionError, requests.exceptions.ConnectTimeout, OSError, socket.error) as e:
@@ -690,10 +735,13 @@ class NetworkManager:
 
             # Linux: SO_BINDTODEVICE pins the socket to a physical NIC
             if sys.platform.startswith("linux") and hasattr(socket, "SO_BINDTODEVICE"):
-                try:
-                    s.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_BINDTODEVICE", 25), ifname.encode())
-                except Exception as be:
-                    logger.warning("SO_BINDTODEVICE failed for '%s': %s", ifname, be)
+                if ifname and ifname not in ["lo", "127.0.0.1", "loopback"]:
+                    try:
+                        s.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_BINDTODEVICE", 25), ifname.encode() + b"\0")
+                    except Exception as be:
+                        s.close()
+                        logger.error("SO_BINDTODEVICE failed for '%s': %s (failing closed)", ifname, be)
+                        return None, 0.0
 
             # Windows & Linux: bind source IP so packets egress via the correct adapter
             if source_ip:
@@ -729,6 +777,7 @@ class NetworkManager:
     def create_requests_session(self, ifname: str) -> requests.Session:
         """Creates a requests.Session whose sockets are bound strictly to `ifname`."""
         session = requests.Session()
+        session.trust_env = False  # Disable untrusted environment proxy inheritance
         ifstat = self.interfaces.get(ifname)
         source_ip = ifstat.ip if ifstat else None
         gateway = ifstat.gateway if ifstat else None

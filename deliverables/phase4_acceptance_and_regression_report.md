@@ -6,8 +6,7 @@
 **Adapters Tested:**
 - Adapter A: `eth1` (Intel(R) Wi-Fi 6E AX211 160MHz, local IP `192.168.1.9`, gateway `192.168.1.1`)
 - Adapter B: `eth2` (Realtek 8812BU Wireless LAN 802.11ac USB NIC, local IP `192.168.1.6`, gateway `192.168.1.1`)
-**Network Topology:** Both adapters attached to local Wi-Fi router (`192.168.1.1`) sharing single upstream ISP egress. Path validation stage: `shared_uplink_single_isp`. **Date:** 14 October 2026  
-**Recorded Suite Result:** **26 Passed, 1 Skipped** (in 33.25s)  
+**Network Topology:** Both adapters attached to local Wi-Fi router (`192.168.1.1`) sharing single upstream ISP egress. Path validation stage: `shared_uplink_single_isp`. **Date:** 14 October 2026 **Recorded Suite Result:** **34 Passed, 1 Skipped** (in 34.82s)  
 **Raw Log File:** [`deliverables/logs/phase4_pytest_output.txt`](file:///C:/Users/thega/.gemini/antigravity-ide/scratch/speedbond/deliverables/logs/phase4_pytest_output.txt)  
 
 ---
@@ -24,44 +23,52 @@ platform linux -- Python 3.14.4, pytest-9.0.2, pluggy-1.6.0 -- /usr/bin/python3
 cachedir: .pytest_cache
 rootdir: /home/tg/speedbond
 plugins: typeguard-4.4.4
-collecting ... collected 27 items
+collecting ... collected 35 items
 
-tests/test_speedbond.py::test_compilation PASSED                         [  3%]
-tests/test_speedbond.py::test_range_success_with_trusted_checksum PASSED [  7%]
-tests/test_speedbond.py::test_range_checksum_mismatch PASSED             [ 11%]
-tests/test_speedbond.py::test_ignored_range_safe_fallback PASSED         [ 14%]
-tests/test_speedbond.py::test_wrong_content_range_rejected PASSED        [ 18%]
-tests/test_speedbond.py::test_oversized_body_rejected PASSED             [ 22%]
-tests/test_speedbond.py::test_truncated_body_rejected PASSED             [ 25%]
-tests/test_speedbond.py::test_incorrect_total_size_rejected PASSED       [ 29%]
-tests/test_speedbond.py::test_etag_mutation_detected PASSED              [ 33%]
-tests/test_speedbond.py::test_cancellation_and_worker_termination PASSED [ 37%]
-tests/test_speedbond.py::test_binding_failure_reported PASSED            [ 40%]
-tests/test_speedbond.py::test_refresh_api_real_http_post PASSED          [ 44%]
-tests/test_speedbond.py::test_path_traversal_actual_http_endpoint PASSED [ 48%]
-tests/test_speedbond.py::test_bound_interface_adapter_socket_options PASSED [ 51%]
-tests/test_speedbond.py::test_physical_adapter_hardware_traffic_isolation SKIPPED [ 55%]
-tests/test_speedbond.py::test_validate_paths_multistage_logic PASSED     [ 59%]
-tests/test_speedbond.py::test_probe_strict_range_and_malformed_rejection PASSED [ 62%]
-tests/test_speedbond.py::test_worker_setup_failure_transitions_to_failed PASSED [ 66%]
-tests/test_speedbond.py::test_single_stream_session_failure_handled PASSED [ 70%]
-tests/test_speedbond.py::test_finalization_lock_state_transition_race PASSED [ 74%]
-tests/test_speedbond.py::test_ssrf_comprehensive_protection PASSED       [ 77%]
-tests/test_speedbond.py::test_fail_closed_socket_binding_error PASSED    [ 81%]
-tests/test_speedbond.py::test_opt_in_linux_policy_routing PASSED         [ 85%]
-tests/test_speedbond.py::test_api_concurrency_limit_and_ssrf_protection PASSED [ 88%]
-tests/test_speedbond.py::test_dns_rebinding_defense_pins_ip_and_preserves_tls PASSED [ 92%]
-tests/test_speedbond.py::test_production_adapter_outbound_binding_verification PASSED [ 96%]
-tests/test_speedbond.py::test_benchmark_hardware_attribution_and_statistical_testing PASSED [100%]
+tests/test_speedbond.py::test_compilation PASSED                         [  2%]
+tests/test_speedbond.py::test_range_success_with_trusted_checksum PASSED [  5%]
+tests/test_speedbond.py::test_range_checksum_mismatch PASSED             [  8%]
+tests/test_speedbond.py::test_ignored_range_safe_fallback PASSED         [ 11%]
+tests/test_speedbond.py::test_wrong_content_range_rejected PASSED        [ 14%]
+tests/test_speedbond.py::test_oversized_body_rejected PASSED             [ 17%]
+tests/test_speedbond.py::test_truncated_body_rejected PASSED             [ 20%]
+tests/test_speedbond.py::test_incorrect_total_size_rejected PASSED       [ 22%]
+tests/test_speedbond.py::test_etag_mutation_detected PASSED              [ 25%]
+tests/test_speedbond.py::test_cancellation_and_worker_termination PASSED [ 28%]
+tests/test_speedbond.py::test_binding_failure_reported PASSED            [ 31%]
+tests/test_speedbond.py::test_refresh_api_real_http_post PASSED          [ 34%]
+tests/test_speedbond.py::test_path_traversal_actual_http_endpoint PASSED [ 37%]
+tests/test_speedbond.py::test_bound_interface_adapter_socket_options PASSED [ 40%]
+tests/test_speedbond.py::test_physical_adapter_hardware_traffic_isolation SKIPPED [ 42%]
+tests/test_speedbond.py::test_validate_paths_multistage_logic PASSED     [ 45%]
+tests/test_speedbond.py::test_probe_strict_range_and_malformed_rejection PASSED [ 48%]
+tests/test_speedbond.py::test_worker_setup_failure_transitions_to_failed PASSED [ 51%]
+tests/test_speedbond.py::test_single_stream_session_failure_handled PASSED [ 54%]
+tests/test_speedbond.py::test_finalization_lock_state_transition_race PASSED [ 57%]
+tests/test_speedbond.py::test_ssrf_comprehensive_protection PASSED       [ 60%]
+tests/test_speedbond.py::test_fail_closed_socket_binding_error PASSED    [ 62%]
+tests/test_speedbond.py::test_opt_in_linux_policy_routing PASSED         [ 65%]
+tests/test_speedbond.py::test_api_concurrency_limit_and_ssrf_protection PASSED [ 68%]
+tests/test_speedbond.py::test_dns_rebinding_defense_pins_ip_and_preserves_tls PASSED [ 71%]
+tests/test_speedbond.py::test_production_adapter_outbound_binding_verification PASSED [ 74%]
+tests/test_speedbond.py::test_benchmark_hardware_attribution_and_statistical_testing PASSED [ 77%]
+tests/test_speedbond.py::test_mock_socket_binding_failure_aborts_before_connect PASSED [ 80%]
+tests/test_speedbond.py::test_dns_rebinding_switch_to_private_ip_blocked PASSED [ 82%]
+tests/test_speedbond.py::test_ipv6_and_dual_stack_support PASSED         [ 85%]
+tests/test_speedbond.py::test_proxy_environment_variables_policy PASSED  [ 88%]
+tests/test_speedbond.py::test_production_connection_inspects_actual_local_and_peer_endpoints PASSED [ 91%]
+tests/test_speedbond.py::test_background_traffic_cannot_pass_nic_attribution PASSED [ 94%]
+tests/test_speedbond.py::test_welch_t_test_against_scipy_reference PASSED [ 97%]
+tests/test_speedbond.py::test_randomized_interleaved_blocks_and_holm_bonferroni_correction PASSED [100%]
 
 =========================== short test summary info ============================
 SKIPPED [1] tests/test_speedbond.py:479: Physical hardware isolation test requires independent egress paths across adapters (current stage: shared_uplink_single_isp). Skipping to avoid overstating dual-adapter isolation.
-======================== 26 passed, 1 skipped in 33.25s ========================
+======================== 34 passed, 1 skipped in 34.82s ========================
 ```
 
 ---
 
-## 2. Detailed Test Case Verification Matrix (26 Passed, 1 Skipped)
+## 2. Detailed Test Case Verification Matrix (34 Passed, 1 Skipped)
 
 | # | Test Identifier | Subsystem Under Test | Verified Behavior & Pass Condition | Result |
 | :-: | :--- | :--- | :--- | :-: |
@@ -92,6 +99,14 @@ SKIPPED [1] tests/test_speedbond.py:479: Physical hardware isolation test requir
 | 25 | `test_dns_rebinding_defense_pins_ip_and_preserves_tls` | Security / DNS Rebinding | Connects directly to pinned pre-validated IP without secondary DNS lookups, eliminating TOCTOU DNS rebinding, while preserving TLS SNI and server certificate validation. Inspects all redirect hops. | **PASSED** |
 | 26 | `test_production_adapter_outbound_binding_verification` | Network Binding | Tests real outbound HTTP requests through production `BoundInterfaceHTTPAdapter`, proving local socket source address matching and socket options. Proves fail-closed behavior on invalid IPs. | **PASSED** |
 | 27 | `test_benchmark_hardware_attribution_and_statistical_testing` | Benchmark Engine | Maps OS counters to selected physical NICs, isolates background traffic ($\ge 15\%$ bytes on both adapters, $\ge 70\%$ combined), calculates statistical distributions, and applies Welch's t-test. | **PASSED** |
+| 28 | `test_mock_socket_binding_failure_aborts_before_connect` | Socket Fail-Closed | Mocks `SO_BINDTODEVICE` / `IP_UNICAST_IF` failure and proves socket is closed and aborted with `InterfaceBindingError` before `connect()` is ever called. | **PASSED** |
+| 29 | `test_dns_rebinding_switch_to_private_ip_blocked` | Connection-Time SSRF | Asserts destination IP re-validated immediately before connection blocks private IP targets and prevents connection attempts. | **PASSED** |
+| 30 | `test_ipv6_and_dual_stack_support` | IPv6 Connectivity | Verifies automatic `AF_INET` vs `AF_INET6` selection, IPv6 4-tuple `(ip, port, 0, 0)` construction, and TLS hostname verification preservation. | **PASSED** |
+| 31 | `test_proxy_environment_variables_policy` | Proxy Security | Proves requests sessions disable environment proxy inheritance by default (`trust_env=False`) and explicit proxies are checked against SSRF prohibitions. | **PASSED** |
+| 32 | `test_production_connection_inspects_actual_local_and_peer_endpoints` | Egress Telemetry | Verifies production connection records and inspects actual socket `local_ip`, `peer_ip`, and applied interface options from the live socket. | **PASSED** |
+| 33 | `test_background_traffic_cannot_pass_nic_attribution` | Benchmark Attribution | Injects background traffic into OS NIC counters and proves it cannot independently pass attribution when process task chunk bytes are 0. | **PASSED** |
+| 34 | `test_welch_t_test_against_scipy_reference` | Statistical Engine | Numerical validation against `scipy.stats.ttest_ind(..., equal_var=False, alternative='greater')` across unequal variances, small samples, zero variance, and N=1. | **PASSED** |
+| 35 | `test_randomized_interleaved_blocks_and_holm_bonferroni_correction` | Trial Design | Verifies randomized block interleaving and step-down Holm-Bonferroni correction for multiple comparisons against both single-adapter baselines. | **PASSED** |
 
 ---
 
@@ -99,12 +114,10 @@ SKIPPED [1] tests/test_speedbond.py:479: Physical hardware isolation test requir
 
 ### Transparent Accounting of Skipped vs. Passed Tests
 In strict compliance with audit findings:
-1. **A skipped test is not a passed test.** The committed test suite execution records **26 passed, 1 skipped**, not 27 passed or 23 passed.
+1. **A skipped test is not a passed test.** The committed test suite execution records **34 passed, 1 skipped**, not 35 passed.
 2. `test_physical_adapter_hardware_traffic_isolation` tests hardware traffic attribution via OS-level interface counters (`/proc/net/dev` on Linux, `Get-NetAdapterStatistics` on Windows).
 3. The test enforces an explicit precondition: if multi-stage validation detects that both adapters share an upstream path (`validation_stage == "shared_uplink_single_isp"`), the test is **SKIPPED** with an explicit reason logged in pytest output:
-   `SKIPPED [1] tests/test_speedbond.py:479: Physical hardware isolation test requires independent egress paths across adapters (current stage: shared_uplink_single_isp). Skipping to avoid overstating dual-adapter isolation.`
 4. Multi-WAN physical aggregation remains clearly marked **UNVERIFIED** until an independent secondary uplink (e.g., Mobile Hotspot with distinct public IP) is provisioned and benchmarked.
-.
 
 ---
 

@@ -63,6 +63,13 @@ def get_windows_nic_statistics() -> Dict[str, Dict[str, int]]:
     return stats
 
 
+try:
+    import scipy.stats
+    _HAS_SCIPY = True
+except ImportError:
+    _HAS_SCIPY = False
+
+
 def get_target_nic_names(net_mgr: NetworkManager, ifnames: List[str]) -> Set[str]:
     """Resolves logical interface names to their exact OS-level NIC counter identifiers."""
     names = set()
@@ -78,7 +85,7 @@ def get_target_nic_names(net_mgr: NetworkManager, ifnames: List[str]) -> Set[str
 
 
 def compute_statistics(samples: List[float]) -> dict:
-    """Computes sample mean, standard deviation, standard error, and 95% confidence interval."""
+    """Computes sample mean, standard deviation, standard error, and 95% Student's t confidence interval."""
     n = len(samples)
     if n == 0:
         return {
@@ -97,14 +104,19 @@ def compute_statistics(samples: List[float]) -> dict:
     variance = sum((x - mean) ** 2 for x in samples) / (n - 1)
     std_dev = math.sqrt(variance)
     stderr = std_dev / math.sqrt(n)
-
-    # Student's t critical values for 95% two-tailed confidence interval (df = n - 1)
-    t_critical_table = {
-        1: 12.71, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571,
-        6: 2.447, 7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228
-    }
     df = n - 1
-    t_crit = t_critical_table.get(df, 1.96)
+
+    if _HAS_SCIPY:
+        t_crit = float(scipy.stats.t.ppf(0.975, df=df))
+    else:
+        t_table = {
+            1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571,
+            6: 2.447, 7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228,
+            15: 2.131, 20: 2.086, 30: 2.042, 60: 2.000, 120: 1.980
+        }
+        closest_df = min(t_table.keys(), key=lambda k: abs(k - df))
+        t_crit = t_table[closest_df] if df <= 120 else 1.96
+
     margin = t_crit * stderr
 
     return {
@@ -119,26 +131,50 @@ def compute_statistics(samples: List[float]) -> dict:
     }
 
 
-def welch_t_test(samples_a: List[float], samples_b: List[float]) -> Tuple[float, bool]:
-    """Performs Welch's two-sample t-test between samples_a (combined) and samples_b (baseline)."""
+def welch_t_test(samples_a: List[float], samples_b: List[float]) -> Tuple[float, float, float, bool]:
+    """
+    Calculates Welch's two-sample t-test (unequal variances) testing H1: mean(A) > mean(B).
+    Returns (t_statistic, p_value, degrees_of_freedom, is_significant).
+    """
     n_a = len(samples_a)
     n_b = len(samples_b)
     if n_a < 2 or n_b < 2:
-        return 0.0, False
+        return 0.0, 1.0, 0.0, False
 
     mean_a = sum(samples_a) / n_a
     mean_b = sum(samples_b) / n_b
     var_a = sum((x - mean_a) ** 2 for x in samples_a) / (n_a - 1)
     var_b = sum((x - mean_b) ** 2 for x in samples_b) / (n_b - 1)
 
-    denom = math.sqrt((var_a / n_a) + (var_b / n_b))
-    if denom == 0:
-        return 0.0, False
+    if var_a == 0.0 and var_b == 0.0:
+        if mean_a == mean_b:
+            return 0.0, 0.5, float(n_a + n_b - 2), False
+        return (float('inf') if mean_a > mean_b else float('-inf')), (0.0 if mean_a > mean_b else 1.0), float(n_a + n_b - 2), (mean_a > mean_b)
 
-    t_stat = (mean_a - mean_b) / denom
-    ci_a_lower = mean_a - 2.0 * math.sqrt(var_a / n_a)
-    is_significant = (t_stat > 2.0) and (ci_a_lower > mean_b)
-    return round(t_stat, 2), is_significant
+    if _HAS_SCIPY:
+        res = scipy.stats.ttest_ind(samples_a, samples_b, equal_var=False, alternative="greater")
+        t_stat = float(res.statistic)
+        p_val = float(res.pvalue)
+        df = float(res.df)
+    else:
+        denom = math.sqrt((var_a / n_a) + (var_b / n_b))
+        if denom == 0.0:
+            return 0.0, 1.0, float(n_a + n_b - 2), False
+        t_stat = (mean_a - mean_b) / denom
+        term_a = var_a / n_a
+        term_b = var_b / n_b
+        num = (term_a + term_b) ** 2
+        den = ((term_a ** 2) / (n_a - 1)) + ((term_b ** 2) / (n_b - 1))
+        df = num / den if den > 0 else float(n_a + n_b - 2)
+        # Approximate one-tailed p-value
+        if t_stat <= 0:
+            p_val = 0.5 + 0.5 * (1.0 - math.exp(-0.717 * abs(t_stat) - 0.416 * (t_stat ** 2)))
+        else:
+            z = t_stat * (1.0 - 1.0 / (4.0 * df)) / math.sqrt(1.0 + t_stat ** 2 / (2.0 * df)) if df > 0 else t_stat
+            p_val = 0.5 * math.erfc(z / math.sqrt(2.0))
+
+    is_significant = (p_val < 0.05) and (t_stat > 0)
+    return round(t_stat, 3), round(p_val, 4), round(df, 2), is_significant
 
 
 def run_single_trial_pass(trial_name: str, url: str, dest_path: str, net_mgr: NetworkManager, 
@@ -199,6 +235,13 @@ def run_single_trial_pass(trial_name: str, url: str, dest_path: str, net_mgr: Ne
             if rx_delta > 1024 or tx_delta > 1024:
                 nic_deltas[nic_name] = {"rx_bytes": rx_delta, "tx_bytes": tx_delta}
 
+    # Process-level telemetry: extract actual bytes transferred per interface by task chunks
+    task_iface_bytes = {}
+    if task.chunks:
+        for c in task.chunks:
+            if c.status == "completed" and c.assigned_iface:
+                task_iface_bytes[c.assigned_iface] = task_iface_bytes.get(c.assigned_iface, 0) + c.downloaded_bytes
+
     total_bytes = task.total_size if task.status == "completed" else 0
     decimal_mb_s = (total_bytes / 1_000_000) / t_elapsed if total_bytes > 0 else 0.0
     binary_mib_s = (total_bytes / 1_048_576) / t_elapsed if total_bytes > 0 else 0.0
@@ -217,6 +260,7 @@ def run_single_trial_pass(trial_name: str, url: str, dest_path: str, net_mgr: Ne
         "sha256": task.sha256_hash or "N/A",
         "checksum_verified": task.checksum_verified,
         "nic_deltas": nic_deltas,
+        "task_iface_bytes": task_iface_bytes,
         "error": task.error_message
     }
 
@@ -272,8 +316,9 @@ def run_benchmark_trial(trial_name: str, url: str, dest_path: str, net_mgr: Netw
     avg_mbps = round(stats["mean"] * 8.0, 2)
     total_retries = sum(r["retries"] for r in runs)
 
-    # Strict Physical NIC Hardware Attribution Check
-    # Maps counters to the selected physical NICs, rules out background traffic, and verifies intended routing
+    # Rigorous Physical NIC Attribution & Task Telemetry Check
+    # Correlates process-level task socket telemetry with OS-level NIC counter deltas.
+    # Background traffic alone cannot satisfy the gate: task chunk bytes on the adapter are mandatory.
     nic_attribution_verified = True
     attribution_details = []
 
@@ -284,17 +329,35 @@ def run_benchmark_trial(trial_name: str, url: str, dest_path: str, net_mgr: Netw
 
         for idx, r in enumerate(runs):
             deltas = r.get("nic_deltas", {})
+            task_bytes = r.get("task_iface_bytes", {})
             payload_sz = r["total_bytes"]
+
+            # Task chunk download bytes per interface
+            t_a = task_bytes.get(if_a, 0)
+            t_b = task_bytes.get(if_b, 0)
+            pct_task_a = (t_a / payload_sz * 100) if payload_sz > 0 else 0.0
+            pct_task_b = (t_b / payload_sz * 100) if payload_sz > 0 else 0.0
+
+            # Corroborating OS NIC counter deltas
             rx_a = max((deltas.get(n, {}).get("rx_bytes", 0) for n in target_names_a if n in deltas), default=0)
             rx_b = max((deltas.get(n, {}).get("rx_bytes", 0) for n in target_names_b if n in deltas), default=0)
+            pct_rx_a = (rx_a / payload_sz * 100) if payload_sz > 0 else 0.0
+            pct_rx_b = (rx_b / payload_sz * 100) if payload_sz > 0 else 0.0
 
-            pct_a = (rx_a / payload_sz * 100) if payload_sz > 0 else 0
-            pct_b = (rx_b / payload_sz * 100) if payload_sz > 0 else 0
-            attribution_details.append(f"Run {idx+1}: {if_a}={rx_a:,}B ({pct_a:.1f}%), {if_b}={rx_b:,}B ({pct_b:.1f}%)")
+            attribution_details.append(
+                f"Run {idx+1}: Task Telemetry -> {if_a}={t_a:,}B ({pct_task_a:.1f}%), {if_b}={t_b:,}B ({pct_task_b:.1f}%); "
+                f"OS NIC Delta -> {if_a}={rx_a:,}B ({pct_rx_a:.1f}%), {if_b}={rx_b:,}B ({pct_rx_b:.1f}%)"
+            )
 
-            # Verification rule: Both selected adapters must carry at least 15% of the payload,
-            # and their combined sum must account for at least 70% of the downloaded bytes
-            if (pct_a < 15.0) or (pct_b < 15.0) or ((pct_a + pct_b) < 70.0):
+            # Verification rule:
+            # 1. Process task telemetry: both selected adapters must carry at least 15%, sum >= 70%
+            # 2. Background traffic rule: if task bytes on an adapter are zero, attribution fails
+            # 3. OS NIC deltas on target adapters must both show positive activity
+            if (pct_task_a < 15.0) or (pct_task_b < 15.0) or ((pct_task_a + pct_task_b) < 70.0):
+                nic_attribution_verified = False
+            if t_a == 0 or t_b == 0:
+                nic_attribution_verified = False
+            if rx_a <= 0 or rx_b <= 0:
                 nic_attribution_verified = False
 
     elif allowed_ifaces and len(allowed_ifaces) == 1:
@@ -302,11 +365,21 @@ def run_benchmark_trial(trial_name: str, url: str, dest_path: str, net_mgr: Netw
         target_names = get_target_nic_names(net_mgr, [target_if])
         for idx, r in enumerate(runs):
             deltas = r.get("nic_deltas", {})
+            task_bytes = r.get("task_iface_bytes", {})
             payload_sz = r["total_bytes"]
+
+            t_target = task_bytes.get(target_if, 0)
+            pct_task = (t_target / payload_sz * 100) if payload_sz > 0 else 0.0
+
             rx_target = max((deltas.get(n, {}).get("rx_bytes", 0) for n in target_names if n in deltas), default=0)
-            pct_target = (rx_target / payload_sz * 100) if payload_sz > 0 else 0
-            attribution_details.append(f"Run {idx+1}: {target_if}={rx_target:,}B ({pct_target:.1f}%)")
-            if pct_target < 70.0:
+            pct_rx = (rx_target / payload_sz * 100) if payload_sz > 0 else 0.0
+
+            attribution_details.append(
+                f"Run {idx+1}: Task Telemetry -> {target_if}={t_target:,}B ({pct_task:.1f}%); "
+                f"OS NIC Delta -> {target_if}={rx_target:,}B ({pct_rx:.1f}%)"
+            )
+
+            if pct_task < 70.0 or rx_target <= 0 or t_target == 0:
                 nic_attribution_verified = False
 
     return {
@@ -378,25 +451,140 @@ def main():
     iface_a = active_ifnames[0]
     iface_b = active_ifnames[1]
 
-    results = []
-
-    # Config A: Primary Adapter Only
     dest_a = os.path.join(args.dest_dir, f"bench_a.bin")
-    res_a = run_benchmark_trial(f"Adapter A Only ({iface_a})", args.url, dest_a, net_mgr, 
-                                allowed_ifaces=[iface_a], trials_count=args.trials, expected_sha256=expected_hash)
-    results.append(res_a)
-
-    # Config B: Secondary Adapter Only
     dest_b = os.path.join(args.dest_dir, f"bench_b.bin")
-    res_b = run_benchmark_trial(f"Adapter B Only ({iface_b})", args.url, dest_b, net_mgr, 
-                                allowed_ifaces=[iface_b], trials_count=args.trials, expected_sha256=expected_hash)
-    results.append(res_b)
-
-    # Config A+B: Combined Parallel Aggregation
     dest_ab = os.path.join(args.dest_dir, f"bench_ab.bin")
-    res_ab = run_benchmark_trial(f"Combined A+B ({iface_a} + {iface_b})", args.url, dest_ab, net_mgr, 
-                                 allowed_ifaces=[iface_a, iface_b], trials_count=args.trials, expected_sha256=expected_hash)
-    results.append(res_ab)
+
+    trials_count = args.trials
+    runs_a = []
+    runs_b = []
+    runs_ab = []
+
+    cfg_a = {"id": "A", "name": f"Adapter A Only ({iface_a})", "dest": dest_a, "ifaces": [iface_a], "runs": runs_a}
+    cfg_b = {"id": "B", "name": f"Adapter B Only ({iface_b})", "dest": dest_b, "ifaces": [iface_b], "runs": runs_b}
+    cfg_ab = {"id": "AB", "name": f"Combined A+B ({iface_a} + {iface_b})", "dest": dest_ab, "ifaces": [iface_a, iface_b], "runs": runs_ab}
+    all_cfgs = [cfg_a, cfg_b, cfg_ab]
+
+    print(f"\n[BENCHMARK SUITE] Executing {trials_count} randomized/interleaved trial block(s)...")
+    for block_idx in range(1, trials_count + 1):
+        if trials_count > 1:
+            print(f"\n==================================================")
+            print(f"  --- [Trial Block {block_idx}/{trials_count} (Randomized Order)] ---")
+            print(f"==================================================")
+        # Randomize trial order within each repeated block to eliminate temporal drift bias
+        block_order = list(all_cfgs)
+        random.shuffle(block_order)
+        order_names = " -> ".join(c["id"] for c in block_order)
+        print(f"  Block {block_idx} order: [{order_names}]")
+
+        for cfg in block_order:
+            print(f"\n  Running {cfg['name']} (Block {block_idx})...")
+            p = run_single_trial_pass(cfg["name"], args.url, cfg["dest"], net_mgr, cfg["ifaces"], expected_hash)
+            cfg["runs"].append(p)
+            print(f"    Pass complete: Status={p['status']} | Elapsed={p['elapsed_sec']}s | Decimal={p['decimal_mb_s']} MB/s | Binary={p['binary_mib_s']} MiB/s")
+
+    # Build summary results for each configuration
+    def _summarize_trial(trial_name: str, runs: list, allowed_ifaces: list) -> dict:
+        failed_runs = [r for r in runs if r["status"] != "completed" or (expected_hash and r.get("checksum_verified") is False)]
+        all_succeeded = (len(failed_runs) == 0)
+        decimal_samples = [r["decimal_mb_s"] for r in runs if r["status"] == "completed"]
+        stats = compute_statistics(decimal_samples)
+
+        if not all_succeeded:
+            return {
+                "trial": trial_name,
+                "status": f"incomplete ({len(failed_runs)}/{len(runs)} runs failed)",
+                "all_succeeded": False,
+                "total_bytes": 0,
+                "elapsed_sec": 0.0,
+                "decimal_mb_s": stats["mean"],
+                "binary_mib_s": 0.0,
+                "bitrate_mbps": 0.0,
+                "retries": sum(r["retries"] for r in runs),
+                "sha256": runs[0].get("sha256", "N/A") if runs else "N/A",
+                "checksum_verified": False,
+                "nic_deltas": runs[0].get("nic_deltas", {}) if runs else {},
+                "nic_attribution_verified": False,
+                "iterations": len(runs),
+                "stats": stats,
+                "runs": runs
+            }
+
+        avg_elapsed = round(sum(r["elapsed_sec"] for r in runs) / len(runs), 2)
+        avg_bin = round(sum(r["binary_mib_s"] for r in runs) / len(runs), 2)
+        avg_mbps = round(stats["mean"] * 8.0, 2)
+        total_retries = sum(r["retries"] for r in runs)
+
+        nic_attribution_verified = True
+        attribution_details = []
+
+        if allowed_ifaces and len(allowed_ifaces) >= 2:
+            if_a, if_b = allowed_ifaces[0], allowed_ifaces[1]
+            target_names_a = get_target_nic_names(net_mgr, [if_a])
+            target_names_b = get_target_nic_names(net_mgr, [if_b])
+            for idx, r in enumerate(runs):
+                deltas = r.get("nic_deltas", {})
+                task_bytes = r.get("task_iface_bytes", {})
+                payload_sz = r["total_bytes"]
+                t_a = task_bytes.get(if_a, 0)
+                t_b = task_bytes.get(if_b, 0)
+                pct_task_a = (t_a / payload_sz * 100) if payload_sz > 0 else 0.0
+                pct_task_b = (t_b / payload_sz * 100) if payload_sz > 0 else 0.0
+                rx_a = max((deltas.get(n, {}).get("rx_bytes", 0) for n in target_names_a if n in deltas), default=0)
+                rx_b = max((deltas.get(n, {}).get("rx_bytes", 0) for n in target_names_b if n in deltas), default=0)
+                pct_rx_a = (rx_a / payload_sz * 100) if payload_sz > 0 else 0.0
+                pct_rx_b = (rx_b / payload_sz * 100) if payload_sz > 0 else 0.0
+                attribution_details.append(
+                    f"Run {idx+1}: Task Telemetry -> {if_a}={t_a:,}B ({pct_task_a:.1f}%), {if_b}={t_b:,}B ({pct_task_b:.1f}%); "
+                    f"OS NIC Delta -> {if_a}={rx_a:,}B ({pct_rx_a:.1f}%), {if_b}={rx_b:,}B ({pct_rx_b:.1f}%)"
+                )
+                if (pct_task_a < 15.0) or (pct_task_b < 15.0) or ((pct_task_a + pct_task_b) < 70.0):
+                    nic_attribution_verified = False
+                if t_a == 0 or t_b == 0 or rx_a <= 0 or rx_b <= 0:
+                    nic_attribution_verified = False
+
+        elif allowed_ifaces and len(allowed_ifaces) == 1:
+            target_if = allowed_ifaces[0]
+            target_names = get_target_nic_names(net_mgr, [target_if])
+            for idx, r in enumerate(runs):
+                deltas = r.get("nic_deltas", {})
+                task_bytes = r.get("task_iface_bytes", {})
+                payload_sz = r["total_bytes"]
+                t_target = task_bytes.get(target_if, 0)
+                pct_task = (t_target / payload_sz * 100) if payload_sz > 0 else 0.0
+                rx_target = max((deltas.get(n, {}).get("rx_bytes", 0) for n in target_names if n in deltas), default=0)
+                pct_rx = (rx_target / payload_sz * 100) if payload_sz > 0 else 0.0
+                attribution_details.append(
+                    f"Run {idx+1}: Task Telemetry -> {target_if}={t_target:,}B ({pct_task:.1f}%); "
+                    f"OS NIC Delta -> {target_if}={rx_target:,}B ({pct_rx:.1f}%)"
+                )
+                if pct_task < 70.0 or rx_target <= 0 or t_target == 0:
+                    nic_attribution_verified = False
+
+        return {
+            "trial": trial_name,
+            "status": "completed",
+            "all_succeeded": True,
+            "total_bytes": runs[0]["total_bytes"],
+            "elapsed_sec": avg_elapsed,
+            "decimal_mb_s": stats["mean"],
+            "binary_mib_s": avg_bin,
+            "bitrate_mbps": avg_mbps,
+            "retries": total_retries,
+            "sha256": runs[0]["sha256"],
+            "checksum_verified": runs[0].get("checksum_verified"),
+            "nic_deltas": runs[-1].get("nic_deltas", {}),
+            "nic_attribution_verified": nic_attribution_verified,
+            "attribution_details": attribution_details,
+            "iterations": len(runs),
+            "stats": stats,
+            "runs": runs
+        }
+
+    res_a = _summarize_trial(cfg_a["name"], runs_a, [iface_a])
+    res_b = _summarize_trial(cfg_b["name"], runs_b, [iface_b])
+    res_ab = _summarize_trial(cfg_ab["name"], runs_ab, [iface_a, iface_b])
+    results = [res_a, res_b, res_ab]
 
     # Statistical Evaluation & Summary Table
     print("\n" + "=" * 105)
@@ -429,10 +617,33 @@ def main():
     combined_speed = res_ab.get("decimal_mb_s", 0.0)
     nic_attributed = res_ab.get("nic_attribution_verified", False)
 
-    # Statistical Significance Testing
+    # Statistical Significance Testing with Predeclared Hypotheses and Holm-Bonferroni Correction
     samples_combined = [r["decimal_mb_s"] for r in res_ab.get("runs", []) if r["status"] == "completed"]
-    samples_best = [r["decimal_mb_s"] for r in best_single_res.get("runs", []) if r["status"] == "completed"]
-    t_stat, is_statistically_significant = welch_t_test(samples_combined, samples_best)
+    samples_a = [r["decimal_mb_s"] for r in res_a.get("runs", []) if r["status"] == "completed"]
+    samples_b = [r["decimal_mb_s"] for r in res_b.get("runs", []) if r["status"] == "completed"]
+
+    t_stat_a, p_val_a, df_a, sig_a = welch_t_test(samples_combined, samples_a)
+    t_stat_b, p_val_b, df_b, sig_b = welch_t_test(samples_combined, samples_b)
+
+    # Holm-Bonferroni step-down correction for m=2 comparisons against both single-adapter baselines
+    comp_list = sorted([
+        ("Adapter A", t_stat_a, p_val_a, df_a),
+        ("Adapter B", t_stat_b, p_val_b, df_b)
+    ], key=lambda x: x[2])
+
+    p_adj_first = min(1.0, comp_list[0][2] * 2)
+    p_adj_second = min(1.0, max(p_adj_first, comp_list[1][2] * 1))
+
+    holm_results = {
+        comp_list[0][0]: {"t_stat": comp_list[0][1], "p_raw": comp_list[0][2], "df": comp_list[0][3], "p_adj": round(p_adj_first, 4), "sig": (p_adj_first < 0.05 and comp_list[0][1] > 0)},
+        comp_list[1][0]: {"t_stat": comp_list[1][1], "p_raw": comp_list[1][2], "df": comp_list[1][3], "p_adj": round(p_adj_second, 4), "sig": (p_adj_second < 0.05 and comp_list[1][1] > 0)}
+    }
+    is_statistically_significant = holm_results["Adapter A"]["sig"] and holm_results["Adapter B"]["sig"]
+
+    if trials_count > 1:
+        print("\n--- Statistical Significance (Holm-Bonferroni Corrected Welch t-tests) ---")
+        print(f"  Comparison vs {comp_list[0][0]}: t={comp_list[0][1]:.3f}, df={comp_list[0][3]:.1f}, raw p={comp_list[0][2]:.4f}, adj p={p_adj_first:.4f} {'(Significant)' if holm_results[comp_list[0][0]]['sig'] else '(Not Significant)'}")
+        print(f"  Comparison vs {comp_list[1][0]}: t={comp_list[1][1]:.3f}, df={comp_list[1][3]:.1f}, raw p={comp_list[1][2]:.4f}, adj p={p_adj_second:.4f} {'(Significant)' if holm_results[comp_list[1][0]]['sig'] else '(Not Significant)'}")
 
     print("\n" + "=" * 65)
     print("  FINAL RELEASE-GATE VERDICT")
@@ -444,17 +655,18 @@ def main():
     elif combined_speed <= best_single_speed:
         print(f"[VERDICT] AGGREGATION UNVERIFIED: Combined speed ({combined_speed:.2f} MB/s) did not exceed single-adapter baseline ({best_single_speed:.2f} MB/s).")
     elif not nic_attributed:
-        print("[VERDICT] ATTRIBUTION UNVERIFIED: Physical NIC counters did not confirm intended multi-adapter distribution.")
+        print("[VERDICT] ATTRIBUTION UNVERIFIED: Physical NIC counters and task telemetry did not confirm intended multi-adapter distribution.")
     elif args.trials == 1:
-        print(f"[VERDICT] SINGLE-TRIAL EMPIRICAL OBSERVATION: Combined speed ({combined_speed:.2f} MB/s) exceeded single-adapter baseline ({best_single_speed:.2f} MB/s).")
-        print("          Variability and statistical significance cannot be certified on N=1. Run with --trials 3+ to verify statistical confidence.")
+        print(f"[VERDICT] SINGLE-TRIAL EMPIRICAL OBSERVATION (DESCRIPTIVE ONLY, N=1):")
+        print(f"          Combined speed ({combined_speed:.2f} MB/s) exceeded single-adapter baseline ({best_single_speed:.2f} MB/s).")
+        print("          N=1 cannot certify statistical significance or rule out network variance. Run with --trials 10+ for rigorous certification.")
     elif not is_statistically_significant:
         print(f"[VERDICT] AGGREGATION INCONCLUSIVE: Empirical gain observed (+{((combined_speed/best_single_speed)-1)*100:.1f}%), but sample variability overlaps.")
-        print(f"          Welch t-stat={t_stat}. Confidence intervals overlap; statistical significance not certified at p < 0.05.")
+        print(f"          Welch t-test with Holm-Bonferroni correction failed to reach significance (p_adj >= 0.05).")
     else:
         st_ab = res_ab.get("stats", {})
         print(f"[VERDICT] PHYSICAL DUAL-WAN AGGREGATION VERIFIED: Statistically significant throughput gain certified across repeated trials.")
-        print(f"          Combined: {st_ab['mean']} MB/s (95% CI: [{st_ab['ci95_lower']}, {st_ab['ci95_upper']}]) vs Baseline: {best_single_speed} MB/s (t={t_stat}, p<0.05).")
+        print(f"          Combined: {st_ab['mean']} MB/s (95% CI: [{st_ab['ci95_lower']}, {st_ab['ci95_upper']}]) vs Baselines A & B (Holm-corrected p < 0.05).")
     print("=" * 65)
 
 

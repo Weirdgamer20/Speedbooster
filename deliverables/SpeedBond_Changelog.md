@@ -4,6 +4,21 @@ All notable changes to the SpeedBond project are documented in this file.
 
 ---
 
+## [v2.1.4] — 2026-10-14
+
+### Security, Connection Architecture & Statistical Rigor (Audit Repair Release)
+* **Fail-Closed Socket Binding (P0):** Eliminated all blanket exception swallowing for mandatory interface options (`SO_BINDTODEVICE`, `IP_UNICAST_IF`, `source_address`). In `security_utils._build_and_bind_safe_socket()` and `NetworkManager._test_interface_egress()`, any failure on mandatory binding options immediately closes the socket and aborts with `InterfaceBindingError` before `connect()` can be attempted. Optional options (`TCP_NODELAY`) remain safely separate.
+* **Effective Connection-Time DNS Validation & Rebinding Defense:** Explicitly passes pre-validated pinned destination IPs into every newly created connection (`conn._pinned_ip`). Destination IPs are re-validated against SSRF policies immediately before connection, completely preventing TOCTOU rebinding pivots. Preserves original hostname for HTTP `Host`, TLS SNI, and server certificate verification.
+* **Dual IPv4 and IPv6 Socket Family Support:** Custom connection classes inspect `ipaddress.ip_address(target_ip)` to automatically instantiate `socket.AF_INET` or `socket.AF_INET6` sockets, constructing standard IPv4 2-tuples `(ip, port)` or IPv6 4-tuples `(ip, port, 0, 0)`. Validates source IP address family matches destination before binding.
+* **Production Connection Telemetry & Outbound Verification:** Instrumented `BoundInterfaceHTTPAdapter`, `DNSRebindingSafeHTTPPool`, and `DNSRebindingSafeHTTPSPool` to record actual connected socket endpoints (`_actual_local_ip`, `_actual_peer_ip`, `_interface_options_applied`). `verify_outbound_binding()` performs an end-to-end HTTP probe and validates actual socket telemetry against `self.source_ip`, never mistaking dummy local binds for physical egress proof.
+* **Explicit Requests Proxy Security Policy:** Disabled automatic environment proxy inheritance (`session.trust_env = False`) across `safe_request_get()` and `create_requests_session()` to prevent `HTTP_PROXY`/`HTTPS_PROXY` from bypassing custom connection routing and SSRF enforcement. Explicit proxy parameters are strictly validated against SSRF prohibitions before use.
+* **Process-Level Benchmark Physical NIC Attribution:** Hardened `benchmark.py` attribution verification by correlating OS-level NIC counter deltas with process-level task socket telemetry (`task_iface_bytes` derived from chunk downloads per interface). Background network traffic on an interface where task bytes are 0 (or $< 15\%$) is explicitly rejected.
+* **Mathematically Valid Welch's t-test & Student's t Distribution:** Replaced heuristic `t > 2` rule with formal Welch's t-test using `scipy.stats.ttest_ind(..., equal_var=False, alternative='greater')` and `scipy.stats.t.ppf` (with full numerical fallback when SciPy is absent). Reports exact t-statistic, Welch-Satterthwaite degrees of freedom, exact p-value, and Student's t 95% confidence intervals. Never claims significance without a calculated p-value $< 0.05$.
+* **Randomized Trial Blocks & Holm-Bonferroni Correction:** In `benchmark.py`, trial configurations (`A`, `B`, `AB`) are randomized and interleaved within repeated blocks to eliminate temporal drift and order bias. Combined throughput is evaluated against *both* single-adapter baselines under predeclared hypotheses using step-down Holm-Bonferroni multiple-comparison correction. Single trials ($N=1$) are strictly labeled as descriptive only.
+* **Expanded Automated Regression Suite (34 Passed, 1 Skipped in 34.82s):** Added 8 new deterministic regression tests covering mandatory socket option failure fail-closed behavior, DNS rebinding private IP blocking, IPv6/dual-stack connectivity, proxy environment isolation, live production adapter telemetry inspection, background traffic attribution rejection, Welch t-test SciPy numerical equivalence, and randomized interleaved block execution with Holm-Bonferroni correction. All 34 tests execute cleanly; hardware isolation remains safely skipped on single-uplink topologies.
+
+---
+
 ## [v2.1.3] — 2026-10-14
 
 ### Security & Robustness (GitHub Audit Fixes)
