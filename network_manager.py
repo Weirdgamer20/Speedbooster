@@ -366,7 +366,7 @@ class BoundInterfaceHTTPAdapter(HTTPAdapter):
                     return False, "Outbound telemetry does not prove IP_UNICAST_IF was applied."
 
             return True, (
-                f"Verified live outbound request through adapter '{self.ifname}' "
+                f"Verified outbound live request through adapter '{self.ifname}' "
                 f"(local: {actual_local_ip}, peer: {actual_peer_ip}, options: {applied_options})"
             )
         except Exception as e:
@@ -525,11 +525,23 @@ class NetworkManager:
         Interface discovery never invokes this method automatically.
         """
         if not sys.platform.startswith("linux"):
-            return {"supported": False, "reason": "Not running on Linux/WSL2"}
+            return {
+                "supported": False,
+                "reason": "Not running on Linux/WSL2",
+                "applied": False,
+                "rollback": False,
+                "plan": [],
+            }
 
         active = [i for i in self.interfaces.values() if i.is_active and i.ip and i.gateway]
         if len(active) < 2:
-            return {"supported": False, "reason": "Requires at least 2 active interfaces with IP and gateway"}
+            return {
+                "supported": False,
+                "reason": "Requires at least 2 active interfaces with IP and gateway",
+                "applied": False,
+                "rollback": False,
+                "plan": [],
+            }
 
         try:
             rule_out = subprocess.check_output(["ip", "rule", "show"], text=True, stderr=subprocess.DEVNULL, timeout=3)
