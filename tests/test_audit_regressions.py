@@ -127,3 +127,16 @@ def test_raw_proxy_socket_fails_closed_without_interface_or_source_binding():
     manager = network_manager.NetworkManager()
     with pytest.raises(network_manager.InterfaceBindingError, match="No mandatory interface or source-address binding"):
         manager.create_bound_socket("lo", "8.8.8.8", 80)
+
+
+
+def test_safe_request_rejects_public_proxy_that_would_bypass_destination_pinning():
+    import requests
+    session = requests.Session()
+    with pytest.raises(requests.exceptions.RequestException, match="bypasses direct destination-IP pinning"):
+        security_utils.safe_request_get(
+            session,
+            "http://8.8.8.8/",
+            proxies={"http": "http://1.1.1.1:8080"},
+            timeout=0.1,
+        )
