@@ -120,7 +120,7 @@ class SpeedBondServer:
                         not normalized_filename
                         or normalized_filename in (".", "..")
                         or os.path.basename(normalized_filename) != normalized_filename
-                        or "\\x00" in normalized_filename
+                        or "\x00" in normalized_filename
                     ):
                         self._send_json({"error": "Filename must be a non-empty basename without path separators"}, status=400)
                         return
