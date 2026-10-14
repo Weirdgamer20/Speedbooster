@@ -831,60 +831,94 @@ class NetworkManager:
         return session
 
     def create_bound_socket(self, ifname: str, host: str, port: int, timeout: float = 15.0, use_ssl: bool = False):
-        """Creates a TCP socket bound strictly to the specified physical interface."""
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        """
+        Creates a source/interface-bound socket to a validated public IP literal.
+        DNS is validated before connect and the socket connects to the selected IP,
+        preventing a second resolver lookup from changing the destination.
+        Private, loopback, link-local, and reserved targets are rejected by default.
+        """
+        if not isinstance(port, int) or not 1 <= port <= 65535:
+            raise InterfaceBindingError(f"Invalid destination port: {port!r}")
+
         ifstat = self.interfaces.get(ifname)
         source_ip = ifstat.ip if ifstat else None
         gateway = ifstat.gateway if ifstat else None
         if_index = ifstat.if_index if ifstat else 0
 
+        clean_host = str(host).strip("[]").lower()
+        url_host = f"[{clean_host}]" if ":" in clean_host else clean_host
+        scheme = "https" if use_ssl else "http"
+        target_url = f"{scheme}://{url_host}:{port}/"
+        is_valid, validation_error, resolved_ips = validate_url_ssrf(target_url, allow_local=False)
+        if not is_valid or not resolved_ips:
+            raise InterfaceBindingError(
+                f"Destination rejected by SSRF/DNS validation ({host}:{port}): {validation_error}"
+            )
+
+        source_family = socket.AF_INET
+        if source_ip:
+            source_family = socket.AF_INET6 if ipaddress.ip_address(source_ip).version == 6 else socket.AF_INET
+
+        # All returned DNS addresses have already been checked. Choose a validated address
+        # compatible with the configured source-address family and connect to that literal.
+        compatible_ips = [
+            ip for ip in resolved_ips
+            if (socket.AF_INET6 if ipaddress.ip_address(ip).version == 6 else socket.AF_INET) == source_family
+        ]
+        if not compatible_ips:
+            raise InterfaceBindingError(
+                f"No validated destination address for '{host}' matches the source/interface address family."
+            )
+        target_ip = compatible_ips[0]
+        target_obj = ipaddress.ip_address(target_ip)
+        family = socket.AF_INET6 if target_obj.version == 6 else socket.AF_INET
+        sock = socket.socket(family, socket.SOCK_STREAM)
+
         logger.info(
-            "Binding raw socket: target=%s:%d, iface='%s', source_ip='%s', gateway='%s', if_index=%d",
-            host, port, ifname, source_ip, gateway, if_index
+            "Binding raw socket: target=%s:%d (validated IP=%s), iface='%s', source_ip='%s', gateway='%s', if_index=%d",
+            host, port, target_ip, ifname, source_ip, gateway, if_index
         )
 
-        if sys.platform.startswith("linux") and hasattr(socket, "SO_BINDTODEVICE") and ifname not in ["lo", "127.0.0.1", "loopback"]:
-            try:
-                sock.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_BINDTODEVICE", 25), ifname.encode() + b"\0")
-            except Exception as e:
-                sock.close()
-                raise InterfaceBindingError(f"Failed to set SO_BINDTODEVICE for interface '{ifname}': {e}") from e
-        elif sys.platform == "win32" and if_index > 0:
-            import struct
-            IP_UNICAST_IF = getattr(socket, "IP_UNICAST_IF", 31)
-            try:
-                sock.setsockopt(socket.IPPROTO_IP, IP_UNICAST_IF, struct.pack("!I", if_index))
-            except Exception as e:
-                sock.close()
-                raise InterfaceBindingError(f"Failed to set IP_UNICAST_IF for interface '{ifname}' (index {if_index}): {e}") from e
-
-        if source_ip:
-            try:
-                sock.bind((source_ip, 0))
-            except Exception as e:
-                sock.close()
-                raise InterfaceBindingError(f"Failed to bind source IP '{source_ip}' for interface '{ifname}': {e}") from e
-
         try:
+            if sys.platform.startswith("linux") and hasattr(socket, "SO_BINDTODEVICE") and ifname not in ["lo", "127.0.0.1", "loopback"]:
+                sock.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_BINDTODEVICE", 25), ifname.encode() + b"\\0")
+            elif sys.platform == "win32" and if_index > 0:
+                import struct
+                if family == socket.AF_INET6:
+                    option = getattr(socket, "IPV6_UNICAST_IF", None)
+                    if option is None:
+                        raise InterfaceBindingError("IPv6 interface binding is unsupported by this Windows socket runtime.")
+                    sock.setsockopt(socket.IPPROTO_IPV6, option, struct.pack("!I", if_index))
+                else:
+                    sock.setsockopt(socket.IPPROTO_IP, getattr(socket, "IP_UNICAST_IF", 31), struct.pack("!I", if_index))
+
+            if source_ip:
+                if ipaddress.ip_address(source_ip).version != target_obj.version:
+                    raise InterfaceBindingError(
+                        f"Source IP {source_ip} and destination {target_ip} use different address families."
+                    )
+                source_addr = (source_ip, 0, 0, 0) if family == socket.AF_INET6 else (source_ip, 0)
+                sock.bind(source_addr)
+
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1048576)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1048576)
-        except Exception:
-            pass
-
-        sock.settimeout(timeout)
-        try:
-            sock.connect((host, port))
-            logger.info("Connected to %s:%d via iface='%s' (local=%s)", host, port, ifname, sock.getsockname())
+            sock.settimeout(timeout)
+            target_addr = (target_ip, port, 0, 0) if family == socket.AF_INET6 else (target_ip, port)
+            sock.connect(target_addr)
+            logger.info(
+                "Connected to %s:%d via iface='%s' (validated peer=%s, local=%s)",
+                host, port, ifname, sock.getpeername(), sock.getsockname()
+            )
+            return sock
         except Exception as e:
             sock.close()
-            logger.error("Connection failed to %s:%d via iface='%s': %s", host, port, ifname, e)
-            raise
-
-        if use_ssl:
-            wrapped = self.ssl_context.wrap_socket(sock, server_hostname=host)
-            return wrapped
-        return sock
+            if isinstance(e, InterfaceBindingError):
+                raise
+            logger.error("Connection failed to validated target %s:%d via iface='%s': %s", target_ip, port, ifname, e)
+            raise InterfaceBindingError(
+                f"Connection to validated destination {target_ip}:{port} failed via '{ifname}': {e}"
+            ) from e
 
     def start_monitoring(self, interval_sec: float = 0.5):
         """Starts real-time stats calculation."""
