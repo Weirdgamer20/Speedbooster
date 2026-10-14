@@ -14,7 +14,7 @@ import ssl
 import ipaddress
 import subprocess
 import threading
-from typing import List, Dict, Optional, Tuple
+from typing import Any, List, Dict, Optional, Tuple
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.connection import create_connection
