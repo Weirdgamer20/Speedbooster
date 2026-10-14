@@ -293,68 +293,85 @@ class BoundInterfaceHTTPAdapter(HTTPAdapter):
 
     def verify_outbound_binding(self, test_url: Optional[str] = None) -> Tuple[bool, str]:
         """
-        Tests an actual outbound connection through this production HTTP adapter and verifies
-        that the connection succeeds, mandatory interface options are applied, and the socket's bound
-        local endpoint matches self.source_ip.
+        Verifies a live outbound request and validates telemetry captured from that request.
+        Socket creation/bind checks alone are not evidence of outbound routing.
         """
+        if not test_url:
+            return False, "Outbound verification requires an explicit live test URL; socket setup alone is insufficient."
+
         ok, err = self.verify_socket_binding()
         if not ok:
             return False, err
 
-        if test_url:
-            try:
-                s = requests.Session()
-                s.trust_env = False
-                s.mount("http://", self)
-                s.mount("https://", self)
-                resp = s.get(test_url, timeout=4.0)
-                if resp.status_code >= 400:
-                    return False, f"Outbound probe returned error HTTP {resp.status_code}"
+        session = requests.Session()
+        session.trust_env = False
+        session.mount("http://", self)
+        session.mount("https://", self)
+        resp = None
+        try:
+            # Stream so the underlying connection remains inspectable until telemetry is checked.
+            resp = session.get(test_url, timeout=4.0, allow_redirects=False, stream=True)
+            if not (200 <= resp.status_code < 300):
+                return False, f"Outbound probe returned HTTP {resp.status_code}; expected a 2xx response."
 
-                # Verify actual socket telemetry from production connection
-                telem = self.last_telemetry or {}
-                actual_local_ip = telem.get("local_ip")
-                actual_peer_ip = telem.get("peer_ip")
-                applied_options = telem.get("options", [])
+            telem = self.last_telemetry or {}
+            actual_local_ip = telem.get("local_ip")
+            actual_peer_ip = telem.get("peer_ip")
+            applied_options = telem.get("options") or []
 
-                if self.source_ip and actual_local_ip and actual_local_ip != self.source_ip:
-                    return False, (
-                        f"Outbound connection local IP mismatch on '{self.ifname}': "
-                        f"expected {self.source_ip}, got actual {actual_local_ip}"
-                    )
+            if not actual_local_ip or not actual_peer_ip:
+                return False, "Outbound probe completed without current-request local/peer socket telemetry."
 
-                return True, (
-                    f"Verified outbound connection through adapter '{self.ifname}' "
-                    f"(local: {actual_local_ip or self.source_ip}, peer: {actual_peer_ip}, options: {applied_options})"
+            if self.source_ip and actual_local_ip != self.source_ip:
+                return False, (
+                    f"Outbound connection local IP mismatch on '{self.ifname}': "
+                    f"expected {self.source_ip}, got actual {actual_local_ip}"
                 )
-            except Exception as e:
-                return False, f"Outbound connection failed through adapter '{self.ifname}': {e}"
 
-        return True, f"Local socket options and address binding verified for '{self.ifname}' (outbound probe unperformed)"
+            if self.source_ip and "source_address" not in applied_options:
+                return False, "Outbound telemetry does not prove that the required source address was bound."
+
+            if sys.platform.startswith("linux") and self.ifname not in ["lo", "127.0.0.1", "loopback"]:
+                bind_opt = getattr(socket, "SO_BINDTODEVICE", 25)
+                if bind_opt not in applied_options:
+                    return False, "Outbound telemetry does not prove SO_BINDTODEVICE was applied."
+
+            if sys.platform == "win32" and self.if_index > 0:
+                bind_opt = getattr(socket, "IP_UNICAST_IF", 31)
+                if bind_opt not in applied_options:
+                    return False, "Outbound telemetry does not prove IP_UNICAST_IF was applied."
+
+            return True, (
+                f"Verified live outbound request through adapter '{self.ifname}' "
+                f"(local: {actual_local_ip}, peer: {actual_peer_ip}, options: {applied_options})"
+            )
+        except Exception as e:
+            return False, f"Outbound connection failed through adapter '{self.ifname}': {e}"
+        finally:
+            if resp is not None:
+                resp.close()
+            session.close()
 
     def send(self, request, **kwargs):
-        """Wraps send to ensure socket-level interface or source-address binding failures fail closed and captures connection telemetry."""
+        """Fail closed on binding errors and refresh telemetry from the connection used by this request."""
+        self.last_telemetry = None
         try:
             resp = super().send(request, **kwargs)
-            # Inspect underlying pool or connection for telemetry if not already populated
-            if not self.last_telemetry:
-                conn = getattr(resp.raw, "_connection", None)
-                if conn:
-                    if hasattr(conn, "last_telemetry") and conn.last_telemetry:
-                        self.last_telemetry = conn.last_telemetry
-                    elif hasattr(conn, "_actual_local_ip"):
-                        self.last_telemetry = {
-                            "local_ip": getattr(conn, "_actual_local_ip", None),
-                            "local_port": getattr(conn, "_actual_local_port", None),
-                            "peer_ip": getattr(conn, "_actual_peer_ip", None),
-                            "peer_port": getattr(conn, "_actual_peer_port", None),
-                            "options": getattr(conn, "_interface_options_applied", []),
-                            "interface_options_applied": getattr(conn, "_interface_options_applied", []),
-                        }
+            conn = getattr(getattr(resp, "raw", None), "_connection", None)
+            if conn is not None:
+                options = list(getattr(conn, "_interface_options_applied", []) or [])
+                self.last_telemetry = {
+                    "local_ip": getattr(conn, "_actual_local_ip", None),
+                    "local_port": getattr(conn, "_actual_local_port", None),
+                    "peer_ip": getattr(conn, "_actual_peer_ip", None),
+                    "peer_port": getattr(conn, "_actual_peer_port", None),
+                    "options": options,
+                    "interface_options_applied": options,
+                }
             return resp
         except InterfaceBindingError:
             raise
-        except (requests.exceptions.ConnectionError, requests.exceptions.ConnectTimeout, OSError, socket.error) as e:
+        except (requests.exceptions.RequestException, OSError, socket.error) as e:
             raise InterfaceBindingError(
                 f"Interface socket binding or connection failed on '{self.ifname}' (IP: {self.source_ip}): {e}"
             ) from e
