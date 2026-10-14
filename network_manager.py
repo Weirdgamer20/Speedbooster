@@ -374,6 +374,9 @@ class BoundInterfaceHTTPAdapter(HTTPAdapter):
         finally:
             if resp is not None:
                 resp.close()
+            # The adapter may be shared with a live downloader session; do not let
+            # closing this temporary probe session close the caller's production adapter.
+            session.adapters.clear()
             session.close()
 
     def send(self, request, **kwargs):
