@@ -120,3 +120,10 @@ def test_proxy_round_robin_starts_with_first_active_interface():
     assert proxy._next_interface() == "first"
     assert proxy._next_interface() == "second"
     assert proxy._next_interface() == "first"
+
+
+
+def test_raw_proxy_socket_fails_closed_without_interface_or_source_binding():
+    manager = network_manager.NetworkManager()
+    with pytest.raises(network_manager.InterfaceBindingError, match="No mandatory interface or source-address binding"):
+        manager.create_bound_socket("unknown-adapter", "8.8.8.8", 80)
