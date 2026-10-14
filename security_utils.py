@@ -7,7 +7,7 @@ secondary DNS resolution TOCTOU races, while preserving correct TLS SNI and cert
 import socket
 import ipaddress
 import urllib.parse
-from typing import Tuple, List, Optional, Dict
+from typing import Tuple, List, Optional, Dict, Union
 import requests
 import urllib3
 from urllib3.connection import HTTPConnection, HTTPSConnection
