@@ -108,3 +108,15 @@ def test_zero_url_port_is_rejected_instead_of_defaulting_to_port_80():
     valid, error, _ = security_utils.validate_url_ssrf("http://8.8.8.8:0/")
     assert valid is False
     assert "Invalid URL port: 0" in error
+
+
+
+def test_proxy_round_robin_starts_with_first_active_interface():
+    manager = network_manager.NetworkManager()
+    manager.interfaces["first"] = network_manager.InterfaceStats(name="first", ip="192.0.2.10")
+    manager.interfaces["second"] = network_manager.InterfaceStats(name="second", ip="192.0.2.11")
+    from proxy import MultiWANProxyServer
+    proxy = MultiWANProxyServer(manager)
+    assert proxy._next_interface() == "first"
+    assert proxy._next_interface() == "second"
+    assert proxy._next_interface() == "first"
