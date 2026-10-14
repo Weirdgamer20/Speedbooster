@@ -59,7 +59,10 @@ def validate_url_ssrf(url: str, allow_local: bool = False) -> Tuple[bool, str, L
         return False, "Missing hostname in URL", []
 
     try:
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        explicit_port = parsed.port
+        port = explicit_port if explicit_port is not None else (443 if parsed.scheme == "https" else 80)
+        if not 1 <= port <= 65535:
+            return False, f"Invalid URL port: {port}", []
     except ValueError as e:
         return False, f"Invalid URL port: {e}", []
 
