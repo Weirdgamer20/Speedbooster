@@ -60,6 +60,17 @@ class SpeedBondServer:
 
             def do_POST(self):
                 parsed = urlparse(self.path)
+
+                # Protect the loopback API from cross-site request forgery. The API intentionally
+                # remains usable by local CLI clients that do not send an Origin header.
+                origin = self.headers.get("Origin")
+                if origin:
+                    origin_parts = urlparse(origin)
+                    request_host = self.headers.get("Host", "").lower()
+                    if origin_parts.scheme not in ("http", "https") or not origin_parts.netloc or origin_parts.netloc.lower() != request_host:
+                        self._send_json({"error": "Cross-origin API mutation rejected"}, status=403)
+                        return
+
                 try:
                     content_len = int(self.headers.get("Content-Length", 0))
                     if content_len > 65536:
