@@ -803,7 +803,7 @@ class NetworkManager:
             sock.settimeout(8.0)
             sock.connect((target_ip, 80))
             latency = (time.time() - t0) * 1000
-            sock.sendall(b"GET / HTTP/1.1\r\\nHost: api.ipify.org\r\\nConnection: close\r\\n\r\\n")
+            sock.sendall(b"GET / HTTP/1.1\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n")
 
             buf = bytearray()
             while len(buf) <= 8192:
@@ -815,11 +815,11 @@ class NetworkManager:
                 logger.warning("Egress probe response exceeded the 8 KiB limit")
                 return None, 0.0
 
-            header_body = bytes(buf).split(b"\r\\n\r\\n", 1)
+            header_body = bytes(buf).split(b"\r\n\r\n", 1)
             if len(header_body) != 2:
                 logger.warning("Egress probe response did not contain a valid HTTP header/body boundary")
                 return None, 0.0
-            status_line = header_body[0].split(b"\r\\n", 1)[0]
+            status_line = header_body[0].split(b"\r\n", 1)[0]
             if not status_line.startswith(b"HTTP/") or b" 200 " not in status_line:
                 logger.warning("Egress probe returned unexpected HTTP status: %r", status_line)
                 return None, 0.0
